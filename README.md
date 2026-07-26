@@ -92,9 +92,12 @@ is a true no-op and `updated_at` only moves when the text actually changes.
 > Most commands below are **planned** — the project is still in Phase 1. Current working piece is
 > the Docker DB + the HN thread-finder.
 
-Requirements: Python 3.12, Docker Desktop, a DeepSeek API key.
+Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), Docker Desktop, a DeepSeek API key.
 
 ```powershell
+# 0. Create the venv and install locked deps
+uv sync
+
 # 1. Bring up Postgres + pgvector
 docker compose up -d
 
@@ -110,6 +113,7 @@ Get-Content db/schema/001_raw_postings.sql -Raw |
 ## Project structure
 
 ```
+pyproject.toml         # deps (uv) + ruff/mypy config; uv.lock is committed
 docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume
 db/schema/             # numbered, re-runnable DDL migrations (001_raw_postings.sql, …)
 src/

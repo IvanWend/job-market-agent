@@ -9,7 +9,14 @@ earlier ones. The pure retrieval + agent lab lives in **product-search**; see
 
 **Working now:** `docker-compose.yml` (Postgres 17 + pgvector, healthcheck, `pgdata` volume,
 `init/` mounted). `src/ingestion/hn_client.py::find_latest_hiring_thread()` resolves the newest HN
-"Who is Hiring" thread's `story_id` + title via the Algolia `search_by_date` endpoint.
+"Who is Hiring" thread's `story_id` + title via the Algolia `search_by_date` endpoint. Toolchain is
+uv + ruff + mypy; repo is on git (`main`).
+
+**Decision (2026-07-26) — two schema mechanisms, one job each.** Compose mounts `./init` at
+`/docker-entrypoint-initdb.d`, whose scripts run **only when the data directory is empty** — first
+boot, then silently never again. That makes it *bootstrap*, not migration. So `db/schema/` stays the
+re-runnable path applied by hand (the skill worth having), and `init/` is reserved for at most
+`CREATE EXTENSION IF NOT EXISTS vector;`. `001_raw_postings.sql` must not live in both.
 
 **Designed, not yet on disk:** `db/schema/001_raw_postings.sql` — DDL with `CHECK`, composite
 `UNIQUE`, and the guarded upsert. Needs to be written, applied from a clean `down -v`, and its three
@@ -19,14 +26,21 @@ conflict behaviors verified.
 
 **Housekeeping / tech debt:**
 - [x] Consolidated the HN client into `src/ingestion/`; fixed both package `__init__.py` files.
-- [ ] `requirements.txt` is a raw `pip freeze` (UTF-16, ~90 transitive deps incl. jupyter/spacy/kaggle).
-      Replace with a curated UTF-8 list of *direct* deps; add a Postgres driver (`psycopg[binary]`).
-      Consider migrating to `uv` + `pyproject.toml` like product-search.
-- [ ] **Not a git repo yet** — `git init` + `.gitignore` (`.venv/`, `.env`, `data/`, `__pycache__/`,
-      `chroma_db/` n/a). Commit `.env.example`, never `.env`.
-- [ ] `.env` is empty — add `POSTGRES_PASSWORD` (compose already reads it), later `DEEPSEEK_API_KEY`.
-- [ ] Minor: `hn_client.py` return has an accidental split string literal (`"objec" "tID"`); rejoin.
-- [ ] Add ruff + mypy to the toolchain once git is in (fast feedback on exactly the above).
+- [x] Dropped `requirements.txt` (UTF-16 `pip freeze`, ~90 stale transitive deps) for `uv` +
+      `pyproject.toml` + committed `uv.lock`. Direct deps only: `requests`, `psycopg[binary]`,
+      `python-dotenv`. `uv sync` prunes anything undeclared — it removed a leftover `httpx`.
+- [x] Git repo bootstrapped: `main` branch, baseline commit, `.gitignore`, `.env.example` committed.
+- [x] `.gitattributes` forces LF — `core.autocrlf=true` is set globally and CRLF files break once
+      mounted into the Linux Postgres container.
+- [x] `.env` has `POSTGRES_PASSWORD`; `DEEPSEEK_API_KEY` placeholder in `.env.example` for Phase 2.
+- [x] `hn_client.py` split string literal (`"objec" "tID"`) rejoined; still resolves the thread.
+- [x] ruff + mypy in the `dev` dependency group (ruff excludes `*.md` so it leaves the aligned
+      comments in the doc fences alone).
+- [ ] **Open, found by mypy:** `hn_client.py:11` — the `params` dict infers as `dict[str, object]`
+      (mixed `str` + `int` values), which `requests.get` rejects. Needs a type annotation, not a
+      value change. Then consider flipping `disallow_untyped_defs = true`.
+- [ ] Optional: `ruff format` would reformat `hn_client.py` (blank line + collapse the
+      `RuntimeError` call). Not applied — decide whether to adopt the formatter.
 
 **Git — ongoing across every phase:**
 - [ ] Every feature: branch → PR → self-review → merge (no direct commits to `main`)

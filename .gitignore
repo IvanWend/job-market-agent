@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Secrets — .env.example is committed, .env never is
+.env
+
+# Ingested data / gold-set working copies
+data/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# IDE / OS
+.claude/settings.local.json
+.vscode/
+.idea/
+Thumbs.db

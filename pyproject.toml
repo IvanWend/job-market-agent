@@ -1,0 +1,37 @@
+[project]
+name = "jobmarket"
+version = "0.1.0"
+description = "Job-market intelligence agent: ingest postings, LLM structured extraction, Postgres + pgvector, DeepSeek agent."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.3.4",
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
+]
+
+[tool.ruff]
+line-length = 100
+# Ruff also formats Python inside markdown fences; the docs use hand-aligned
+# comments on purpose, so keep it away from them.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I import sorting, UP pyupgrade, B bugbear, ISC implicit str concat
+select = ["E", "W", "F", "I", "UP", "B", "ISC"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+warn_return_any = true
+# Checks bodies of unannotated functions too, without demanding annotations yet.
+# Flip on disallow_untyped_defs once the ingestion modules carry signatures.
+check_untyped_defs = true
+disallow_untyped_defs = false
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "ruff>=0.16.0",
+    "types-requests>=2.33.0.20260712",
+]

@@ -1,0 +1,11 @@
+# core.autocrlf=true is set globally, which would hand CRLF working-copy files to
+# the Linux Postgres container (fatal for anything mounted into
+# /docker-entrypoint-initdb.d and executed as a shell script).
+# Normalize to LF in the repo *and* in the working tree for everything that
+# crosses the container boundary.
+* text=auto eol=lf
+
+# Binary — never touch.
+*.png binary
+*.jpg binary
+*.gif binary

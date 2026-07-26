@@ -1,7 +1,6 @@
 services:
   db:
     image: pgvector/pgvector:pg17
-    container_name: jobmarket-db
     environment:
       POSTGRES_USER: jobmarket
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}

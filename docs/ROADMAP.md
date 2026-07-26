@@ -22,7 +22,13 @@ re-runnable path applied by hand (the skill worth having), and `init/` is reserv
 `UNIQUE`, and the guarded upsert. Needs to be written, applied from a clean `down -v`, and its three
 conflict behaviors verified.
 
-**Next step:** write + verify the DDL, then fetch top-level comments and write the idempotent loader.
+**Next step:** fetch all top-level comments for the thread (paginate Algolia), then write the
+idempotent loader in `load.py` around the already-verified upsert.
+
+**Compose note:** `container_name:` was removed. It is a *global* Docker name, so after the project
+directory was renamed (`job-market-agent` → `jobmarket`) the old stopped container still owned the
+name and blocked `up`. Compose now scopes the name itself (`jobmarket-db-1`). An orphaned
+`job-market-agent_pgdata` volume from the old project is still on disk and can be deleted.
 
 **Housekeeping / tech debt:**
 - [x] Consolidated the HN client into `src/ingestion/`; fixed both package `__init__.py` files.
@@ -54,9 +60,12 @@ conflict behaviors verified.
   - [ ] fetch all **top-level** comments for that `story_id` (paginate; HTML text; drop deleted/empty)
 - [ ] Remotive client
 - [~] `raw_postings` schema + loader with dedup
-  - [~] DDL `db/schema/001_raw_postings.sql` — designed (CHECK + composite unique + guarded upsert);
-        pending clean-apply + dedup verification
-  - [ ] loader: idempotent upsert on `(source, external_id)`
+  - [x] DDL `db/schema/001_raw_postings.sql` — applied clean, re-apply is a no-op. Verified: the
+        guarded upsert gives `INSERT 0 1` / `0 0` / `0 1`, `(remotive, test-1)` inserts alongside
+        `(hn, test-1)`, and all five constraints reject bad rows (bad source, mid-month
+        `thread_month`, HN without a month, blank text, manual `id`).
+  - [ ] loader: idempotent upsert on `(source, external_id)` — SQL verified, needs wiring in
+        `load.py` with `psycopg`
 - [ ] Target: ~700 raw postings loaded
 - [ ] Collect gold-set candidates while ingesting (copy ~30 deliberately messy HN posts aside)
 

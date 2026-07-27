@@ -19,19 +19,28 @@ the retrieval/agent lab is the separate **product-search** repo. Built skill-by-
 - Watch my token budget: prefer a fresh session per phase over dragging a long context around, and
   say so when a wrap-up + new session is the cheaper move.
 
-**Where we left off (2026-07-26):** Phase 1 (ingestion) in progress. Working: `docker-compose.yml`
-(Postgres 17 + pgvector) and `hn_client.py::find_latest_hiring_thread()`. The `raw_postings` DDL
-(`db/schema/001_raw_postings.sql`) is **designed but not yet on disk** — CHECK + composite unique +
-guarded upsert. Repo is **not yet under git**; `requirements.txt` still needs cleanup; `.env` empty.
+**Where we left off (2026-07-27):** Phase 1 (ingestion), ~halfway. Done: `docker-compose.yml`
+(Postgres 17 + pgvector), `db/schema/001_raw_postings.sql` applied with all five constraints and the
+guarded upsert verified by hand, and `src/ingestion/hn_client.py` **complete** —
+`find_latest_hiring_thread()` plus `fetch_thread(story_id) -> HNThread` (frozen dataclasses
+`HNThread`/`HNComment`, one `/items/` call, 276 comments off the July 2026 thread). ruff, `ruff
+format` and mypy are all clean. Repo is on git (`main`, 3 commits).
 
-**Next up (pick one):**
-1. Write `db/schema/001_raw_postings.sql`, apply it from a clean `docker compose down -v`, and verify
-   the three upsert conflict behaviors (`INSERT 0 1` / `0 0` / `0 1`; Remotive `test-1` also inserts).
-2. Housekeeping first: `git init` + `.gitignore`, curate `requirements.txt` (+ `psycopg[binary]`),
-   `.env.example`.
-3. Then: extend `hn_client.py` to fetch all top-level comments for the `story_id`, and write the
-   idempotent loader (`load.py`) that upserts them into `raw_postings`.
+`src/ingestion/load.py` is an **empty file** — that's the next piece.
 
-Start by checking the current state of the repo in case I've changed things since. Do not make any changes. We are just planning.
+**Next up (in order):**
+1. `load.py`: parse `thread.created_at` (raw ISO) → `.date().replace(day=1)` for `thread_month`, map
+   each `HNComment` to `(source='hn', external_id, raw_text, thread_month)`, and run the guarded
+   upsert via `psycopg`. Report inserted-vs-unchanged counts so idempotency is visible on re-run.
+   Needs a `DATABASE_URL` in `.env` / `.env.example` (only `POSTGRES_PASSWORD` is there now).
+2. `init/001_extensions.sql` with `CREATE EXTENSION IF NOT EXISTS vector;` — `init/` is empty and
+   git doesn't track empty dirs, so pgvector currently gets created nowhere.
+3. Remotive client, then load to the ~700-posting target.
+
+**Watch out:** start Docker Desktop before anything DB-shaped (it was down last session). Use
+`uv run python -m mypy src` — the `mypy.exe` shim in `.venv` is a broken uv trampoline. And put the
+loader on a branch; the roadmap says no direct commits to `main` and all 3 so far ignored that.
+
+Start by checking the current state of the repo in case I've changed things since.
 
 ---

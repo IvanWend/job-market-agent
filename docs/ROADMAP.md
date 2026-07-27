@@ -5,12 +5,13 @@ ingestion → LLM extraction + evals → storage/retrieval → agent → serving
 earlier ones. The pure retrieval + agent lab lives in **product-search**; see
 [out of scope](#deliberately-out-of-scope-lives-in-product-search).
 
-## Build status (updated 2026-07-26)
+## Build status (updated 2026-07-27)
 
 **Working now:** `docker-compose.yml` (Postgres 17 + pgvector, healthcheck, `pgdata` volume,
-`init/` mounted). `src/ingestion/hn_client.py::find_latest_hiring_thread()` resolves the newest HN
-"Who is Hiring" thread's `story_id` + title via the Algolia `search_by_date` endpoint. Toolchain is
-uv + ruff + mypy; repo is on git (`main`).
+`init/` mounted). `db/schema/001_raw_postings.sql` applied and verified. `hn_client.py` is
+**complete**: `find_latest_hiring_thread()` resolves the newest thread via `search_by_date`, and
+`fetch_thread(story_id)` returns a typed `HNThread` with its top-level comments. Toolchain is
+uv + ruff + mypy, all three clean. Repo is on git (`main`).
 
 **Decision (2026-07-26) — two schema mechanisms, one job each.** Compose mounts `./init` at
 `/docker-entrypoint-initdb.d`, whose scripts run **only when the data directory is empty** — first
@@ -18,12 +19,24 @@ boot, then silently never again. That makes it *bootstrap*, not migration. So `d
 re-runnable path applied by hand (the skill worth having), and `init/` is reserved for at most
 `CREATE EXTENSION IF NOT EXISTS vector;`. `001_raw_postings.sql` must not live in both.
 
-**Designed, not yet on disk:** `db/schema/001_raw_postings.sql` — DDL with `CHECK`, composite
-`UNIQUE`, and the guarded upsert. Needs to be written, applied from a clean `down -v`, and its three
-conflict behaviors verified.
+**Decision (2026-07-27) — `/items/` over paginated search.** Two Algolia routes reach a thread's
+comments. `search_by_date?tags=comment,story_<id>` returns every comment at every depth (436 for the
+July 2026 thread, of which 276 are top-level), so it needs a client-side `parent_id` filter and
+pagination once a thread passes the 1000-hit ceiling. `/api/v1/items/<story_id>` returns the tree in
+one request, where `children` *is* the top-level list — no pagination, no depth filter — and carries
+the story's own `created_at` and `title` in the same payload. Verified: both routes agree at 276.
 
-**Next step:** fetch all top-level comments for the thread (paginate Algolia), then write the
-idempotent loader in `load.py` around the already-verified upsert.
+**Decision (2026-07-27) — the client speaks HN, the loader speaks SQL.** `fetch_thread` returns
+`HNThread`/`HNComment` (frozen dataclasses), *not* dicts shaped like table columns, so that exactly
+one module knows `raw_postings`' column names when the Remotive client lands. Consequence: the
+client returns `created_at` as the **raw ISO string**; `load.py` owns the truncation to
+`thread_month`. The field is deliberately not named `thread_month` in the client — it holds a full
+timestamp, and a name that promises a month would read as correct in review while being wrong.
+`raw_postings_thread_month_is_month_start` is the backstop if the loader ever forgets.
+
+**Next step:** write `load.py` — parse `thread.created_at` → `.date().replace(day=1)`, map each
+`HNComment` to `(source='hn', external_id, raw_text, thread_month)`, and run the already-verified
+guarded upsert through `psycopg`.
 
 **Compose note:** `container_name:` was removed. It is a *global* Docker name, so after the project
 directory was renamed (`job-market-agent` → `jobmarket`) the old stopped container still owned the
@@ -42,22 +55,36 @@ name and blocked `up`. Compose now scopes the name itself (`jobmarket-db-1`). An
 - [x] `hn_client.py` split string literal (`"objec" "tID"`) rejoined; still resolves the thread.
 - [x] ruff + mypy in the `dev` dependency group (ruff excludes `*.md` so it leaves the aligned
       comments in the doc fences alone).
-- [ ] **Open, found by mypy:** `hn_client.py:11` — the `params` dict infers as `dict[str, object]`
-      (mixed `str` + `int` values), which `requests.get` rejects. Needs a type annotation, not a
-      value change. Then consider flipping `disallow_untyped_defs = true`.
-- [ ] Optional: `ruff format` would reformat `hn_client.py` (blank line + collapse the
-      `RuntimeError` call). Not applied — decide whether to adopt the formatter.
+- [x] Closed the mypy `params` error: annotated `dict[str, str | int]`. Mixed `str`+`int` values
+      infer as `dict[str, object]`, and `object` isn't in the union `requests.get` accepts — so the
+      fix is an annotation, not a value change. `mypy src` is now clean; consider flipping
+      `disallow_untyped_defs = true`.
+- [x] `ruff format` applied to `hn_client.py`; all four files now report "already formatted".
+      Adopting it repo-wide is therefore free — no reformat churn pending.
+- [ ] **Tooling gotcha:** `.venv/Scripts/mypy.exe` is a broken uv trampoline (`failed to
+      canonicalize script path`). Use `uv run python -m mypy src`. `ruff.exe` works fine.
+- [ ] `init/` is empty, and git does not track empty directories — so a fresh clone has no `init/`,
+      Docker auto-creates it, and `CREATE EXTENSION vector` runs nowhere. Add
+      `init/001_extensions.sql` before Phase 3 or pgvector will fail confusingly.
 
 **Git — ongoing across every phase:**
 - [ ] Every feature: branch → PR → self-review → merge (no direct commits to `main`)
+      — **not yet honoured**: all three commits so far went straight to `main`. Start with the
+      loader on a branch.
 - [ ] Commit early and often (lesson: mid-session revert on cv-tailor-ru)
 
 ## Phase 1 — Ingestion (no LLM calls) ← IN PROGRESS
 
 - [x] Docker Compose: Postgres 17 + pgvector (healthcheck, named volume, `init/` entrypoint)
-- [~] Algolia HN client
+- [x] Algolia HN client
   - [x] `find_latest_hiring_thread()` → newest thread `story_id` + title
-  - [ ] fetch all **top-level** comments for that `story_id` (paginate; HTML text; drop deleted/empty)
+  - [x] `fetch_thread(story_id)` → `HNThread` with all **top-level** comments. One `/items/` call,
+        so no pagination. Comment `id` → `str` (it is the `external_id` dedup key; the API returns
+        an int). Text kept as **verbatim HTML** — the table is a replay buffer, and stripping is a
+        lossy parse that Phase 2 should do instead. Drops unusable comments via
+        `(child.get("text") or "").strip()`, which covers all three shapes: absent key, present-but-
+        null (deleted), and whitespace-only. `.get("text", "")` does **not** — a default only fires
+        on a missing key, never on a present `null`.
 - [ ] Remotive client
 - [~] `raw_postings` schema + loader with dedup
   - [x] DDL `db/schema/001_raw_postings.sql` — applied clean, re-apply is a no-op. Verified: the

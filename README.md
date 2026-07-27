@@ -89,8 +89,8 @@ is a true no-op and `updated_at` only moves when the text actually changes.
 
 ## Setup
 
-> Most commands below are **planned** — the project is still in Phase 1. Current working piece is
-> the Docker DB + the HN thread-finder.
+> Most commands below are **planned** — the project is still in Phase 1. Working today: the Docker
+> DB, the `raw_postings` schema, and the HN client (thread lookup + comment fetch).
 
 Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), Docker Desktop, a DeepSeek API key.
 
@@ -118,8 +118,8 @@ docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume
 db/schema/             # numbered, re-runnable DDL migrations (001_raw_postings.sql, …)
 src/
   ingestion/
-    hn_client.py       # Algolia HN client: find thread → fetch top-level comments
-    load.py            # upsert raw postings into Postgres (idempotent)
+    hn_client.py       # Algolia HN client: find thread → fetch top-level comments (HNThread)
+    load.py            # upsert raw postings into Postgres (idempotent) — not yet written
 docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log
   PROMPT.md            # paste-to-start session kickoff brief

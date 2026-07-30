@@ -8,7 +8,7 @@ ALGOLIA_ITEM_URL = "https://hn.algolia.com/api/v1/items"
 
 @dataclass(frozen=True)
 class HNComment:
-    id: str  
+    id: str
     text: str
 
 

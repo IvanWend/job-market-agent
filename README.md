@@ -32,10 +32,10 @@ grounding and catch fabrication (lesson carried from cv-tailor-ru).
 
 | Concern | Choice |
 |---|---|
-| Language | Python 3.12 |
+| Language | Python 3.13 (pinned via `.python-version`; `requires-python >=3.12`) |
 | Agent + extraction LLM | DeepSeek (OpenAI-compatible API); Groq fallback |
 | Structured outputs | Pydantic v2 — the schema is the contract for extraction *and* evals |
-| Embeddings | `BAAI/bge-small-en-v1.5`, local via sentence-transformers (384-dim) |
+| Embeddings | **Undecided** — `BAAI/bge-small-en-v1.5` via sentence-transformers (384-dim) as designed, vs. `bge-m3` via the already-installed local Ollama (1024-dim). Fixes `vector(n)`, so decide before Phase 3 ([ROADMAP](docs/ROADMAP.md#phase-3--storage--retrieval)) |
 | Database | Postgres 17 + pgvector (single DB: relational + vector) |
 | API | FastAPI, SSE streaming |
 | Tracing | Langfuse (self-hosted, Docker) — every LLM call traced from day one |
@@ -80,42 +80,68 @@ raw_postings (
   CHECK (source IN ('hn','remotive','adzuna')), UNIQUE (source, external_id)
 )
 structured_postings ( id, raw_posting_id FK, extracted JSONB, model, prompt_version, extracted_at )
-posting_embeddings  ( posting_id FK, embedding vector(384), embedded_text )
+posting_embeddings  ( posting_id FK, embedding vector(384|1024), embedded_text )  -- dim TBD
 ```
 
-Ingestion is **idempotent**: the loader upserts on `(source, external_id)` with a guarded
-`ON CONFLICT … DO UPDATE … WHERE raw_text IS DISTINCT FROM …`, so re-fetching an unchanged posting
-is a true no-op and `updated_at` only moves when the text actually changes.
+Ingestion is **designed to be idempotent**: the loader upserts on `(source, external_id)` with a
+guarded `ON CONFLICT … DO UPDATE … SET updated_at = now() WHERE raw_text IS DISTINCT FROM …`, so
+re-fetching an unchanged posting is a true no-op and `updated_at` only moves when the text actually
+changes. The `UNIQUE (source, external_id)` constraint that arbitrates this is in place and the SQL
+was verified by hand in psql — but it is **not yet wired into `load.py`**, whose current draft
+conflicts on `(external_id)` alone and would fail with `42P10`. Tracked in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Setup
 
-> Most commands below are **planned** — the project is still in Phase 1. Working today: the Docker
-> DB, the `raw_postings` schema, and the HN client (thread lookup + comment fetch).
+> Most commands below are **planned** — the project is still in Phase 1. Working today: the
+> `raw_postings` DDL and the HN client (thread lookup + comment fetch). The loader's DB half is
+> unwired, and the database is currently un-provisioned.
 
-Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/), Docker Desktop, a DeepSeek API key.
+Developed on **WSL2 Ubuntu** with Docker Engine running natively in WSL (systemd) — *not* Docker
+Desktop. Requirements: Python 3.12+ (3.13 pinned via `.python-version`),
+[uv](https://docs.astral.sh/uv/), Docker Engine + Compose, `postgresql-client`, a DeepSeek API key.
 
-```powershell
+```bash
 # 0. Create the venv and install locked deps
 uv sync
 
-# 1. Bring up Postgres + pgvector
+# 1. Bootstrap the pgvector extension BEFORE first boot.
+#    ./init is mounted at /docker-entrypoint-initdb.d, which runs only when the
+#    data directory is empty — first boot, then silently never again.
+mkdir -p init
+printf 'CREATE EXTENSION IF NOT EXISTS vector;\n' > init/001_extensions.sql
+
+# 2. Bring up Postgres + pgvector
 docker compose up -d
+docker compose ps                       # wait for "healthy"
 
-# 2. Apply the schema (re-runnable)
-Get-Content db/schema/001_raw_postings.sql -Raw |
-  docker compose exec -T db psql -U jobmarket -d jobmarket -v ON_ERROR_STOP=1 -f -
+# 3. Apply the schema (re-runnable, so safe to repeat)
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/001_raw_postings.sql
 
-# 3. .env (git-ignored) — see .env.example
+# 4. .env (git-ignored) — see .env.example
 #   POSTGRES_PASSWORD=...
+#   DATABASE_URL=postgresql://jobmarket:...@localhost:5432/jobmarket
 #   DEEPSEEK_API_KEY=sk-...
 ```
+
+Step 3 uses the host `psql` directly rather than `docker compose exec` — one less indirection, and
+it proves `DATABASE_URL` actually works before the loader depends on it.
+
+**If Ollama is on a Windows host** (the current setup), reach it from WSL at `localhost:11434` with
+`networkingMode=mirrored` in `.wslconfig`. Keep `no_proxy` free of glob patterns — `curl` tolerates
+`127.*` and `<local>`, but `urllib`/`requests`/`httpx` do not, and localhost calls will silently
+take the proxy. See the environment table in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Project structure
 
 ```
 pyproject.toml         # deps (uv) + ruff/mypy config; uv.lock is committed
-docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume
-db/schema/             # numbered, re-runnable DDL migrations (001_raw_postings.sql, …)
+.python-version        # 3.13 — uv reads this
+.env.example           # committed key names, no values; .env is git-ignored
+.gitattributes         # force LF (files cross into the Linux Postgres container)
+docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume, ./init mount
+db/schema/             # numbered, re-runnable DDL applied by hand (001_raw_postings.sql, …)
+init/                  # NOT YET CREATED — first-boot bootstrap only (CREATE EXTENSION vector)
 src/
   ingestion/
     hn_client.py       # Algolia HN client: find thread → fetch top-level comments (HNThread)
@@ -124,6 +150,12 @@ docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log
   PROMPT.md            # paste-to-start session kickoff brief
 ```
+
+Two schema mechanisms, one job each: `init/` is **bootstrap** (runs once, only when the data
+directory is empty) and `db/schema/` is the **re-runnable** path applied by hand. No file belongs in
+both — see the 2026-07-26 decision in the roadmap. There is no `tests/` yet, and the project is
+intentionally not an installable package (no `[build-system]`), so imports are `src.ingestion.…`
+from the repo root.
 
 ## Scope
 

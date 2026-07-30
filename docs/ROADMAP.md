@@ -12,13 +12,43 @@ earlier ones. The pure retrieval + agent lab lives in **product-search**; see
 - I write the code; the assistant guides, reviews, and verifies (read + run before assessing).
 - Paste errors, not fixes. No silent edits to project files.
 
-## Build status (updated 2026-07-28)
+## Build status (updated 2026-07-30)
 
-**Working now:** `docker-compose.yml` (Postgres 17 + pgvector, healthcheck, `pgdata` volume,
-`init/` mounted). `db/schema/001_raw_postings.sql` applied and verified. `hn_client.py` is
-**complete**: `find_latest_hiring_thread()` resolves the newest thread via `search_by_date`, and
-`fetch_thread(story_id)` returns a typed `HNThread` with its top-level comments. Toolchain is
-uv + ruff + mypy, all three clean. Repo is on git (`main`).
+**Working now:** `hn_client.py` is **complete**: `find_latest_hiring_thread()` resolves the newest
+thread via `search_by_date`, and `fetch_thread(story_id)` returns a typed `HNThread` with its
+top-level comments. Toolchain is uv + ruff + mypy, all three clean. Repo is on git (`main`, level
+with `origin/main`).
+
+**Not running:** the database. The dev environment moved to WSL2 (below), which means a **fresh
+Docker with no volumes** — `docker compose ps` is empty and the `pgdata` volume from the old
+Docker Desktop install is gone. `001_raw_postings.sql` was applied and verified in that old
+volume, so the schema must be re-applied before the loader can be tested. Treat the DB as
+un-provisioned.
+
+**Environment (2026-07-30) — moved from PowerShell/Docker Desktop to WSL2.** Verified end to end:
+
+| Layer | State |
+|---|---|
+| Shell / repo | WSL2 Ubuntu, bash. Repo on **ext4** (`~/projects/job-market-agent`), not `/mnt/c` |
+| Python | uv 0.11.32, CPython 3.13.14, `.venv` Linux-side (`bin/`, no `Scripts/`), `uv.lock` in sync |
+| Docker | **Engine native in WSL** (systemd, `enabled` at boot, user in `docker` group). No Docker Desktop |
+| Postgres client | `psql` / `pg_dump` 17.10 installed on the host — no more `docker exec` round-trips |
+| Ollama | Stays on the **Windows** host, reached at `localhost:11434` via `networkingMode=mirrored`. Models present: `bge-m3` (1024-dim, embedding), `qwen2.5:3b-instruct`, `qwen2.5:7b-instruct` |
+| Proxy | v2rayN `127.0.0.1:10808` (mixed inbound: HTTP **and** SOCKS5). Three independent scopes, all green |
+
+**Decision (2026-07-30) — one proxy definition, not four.** `autoProxy=true` used to mirror the
+Windows proxy into WSL, but it injected a **Windows-format** `no_proxy` (`127.*`, `<local>`) that
+curl tolerates and `urllib`/`requests`/`httpx` silently do not — so localhost traffic could take the
+proxy. Now `autoProxy=false` and `~/.proxy.env` is the single source of truth, sourced from
+`~/.profile` (login shells) and `~/.bashrc` (interactive), with `~/.config/environment.d/10-proxy.conf`
+for `systemctl --user`. `no_proxy` uses plain hosts and leading-dot suffixes only — **no globs**.
+`ALL_PROXY` deliberately stays `http://`: 10808 also speaks SOCKS5, but `socks5h://` makes `requests`
+raise `InvalidSchema` unless `pysocks` is installed. The Docker **daemon** is a separate scope —
+`/etc/systemd/system/docker.service.d/http-proxy.conf` — and is unaffected by any of the above.
+
+*Residual gap (accepted):* a cold non-interactive, non-login shell (`bash -c` spawned outside a
+login session) reads neither `.profile` nor `.bashrc`, so it falls back to whatever the parent
+passes. `BASH_ENV` covers the case where the parent *was* a login shell. Not worth chasing further.
 
 **Decision (2026-07-26) — two schema mechanisms, one job each.** Compose mounts `./init` at
 `/docker-entrypoint-initdb.d`, whose scripts run **only when the data directory is empty** — first
@@ -43,15 +73,19 @@ timestamp, and a name that promises a month would read as correct in review whil
 
 **In progress — `load.py` flow** (skeleton written 2026-07-28; runs end-to-end, DB half unwired):
 
-1. [x] Pre-flight: `docker compose up -d`, `DATABASE_URL` in `.env`, branch `feat/loader`.
+1. [ ] Pre-flight: `docker compose up -d`, re-apply `001_raw_postings.sql` (the old volume is gone),
+   `DATABASE_URL` in `.env`, work on a branch.
 2. [x] `to_thread_month(created_at: str) -> date` — `fromisoformat` (handles the `Z`), stay in UTC,
    `.date().replace(day=1)`. Returns `date(2026, 7, 1)`; mypy clean.
-3. [~] `thread_to_rows(thread) -> list[tuple]` — emits `(source, external_id, raw_text,
-   thread_month)`, month derived once outside the loop; mypy clean. *One bug left: `source` is
-   `"HN"`, but the CHECK is `source IN ('hn', …)`.* Throwaway when Remotive lands.
-4. [ ] `UPSERT_SQL` — write it in psql by hand first. *Current draft names `title`/`created_at`/
-   `text` (none exist), omits `source`, and conflicts on `(external_id)` where the unique
-   constraint is `(source, external_id)`.*
+3. [x] `thread_to_rows(thread) -> list[tuple]` — emits `(source, external_id, raw_text,
+   thread_month)`, month derived once outside the loop; mypy clean. The `"HN"`/`"hn"` case bug is
+   **fixed** (`load.py:33` emits `"hn"`). Throwaway when Remotive lands.
+4. [ ] `UPSERT_SQL` — write it in psql by hand first. *Current draft conflicts on `(external_id)`
+   where the only unique constraint is `(source, external_id)`, so Postgres raises*
+   `42P10 there is no unique or exclusion constraint matching the ON CONFLICT specification`
+   *— it cannot execute at all. It also never sets `updated_at = now()` and has no `WHERE` guard,
+   so even with the conflict target fixed, (b) "identical row is a no-op" and (c) "changed field
+   bumps `updated_at`" would both still fail.*
 5. [ ] `upsert_postings(conn, rows) -> LoadStats` — source-agnostic, reused by Remotive. Caller
    owns the transaction. Returns counts; does not print.
 6. [x] `__main__`: find thread → fetch → rows → print. Verified: 276 rows off the July 2026 thread.
@@ -62,10 +96,13 @@ Gotchas: `DO UPDATE` must set `updated_at = now()` (no trigger exists); count vi
 `RETURNING (xmax = 0)` — a suppressed guarded update returns *no row*, so `unchanged = len(rows) -
 returned`; `with psycopg.connect()` commits on clean exit (not autocommit); `%s` placeholders only.
 
-**Compose note:** `container_name:` was removed. It is a *global* Docker name, so after the project
-directory was renamed (`job-market-agent` → `jobmarket`) the old stopped container still owned the
-name and blocked `up`. Compose now scopes the name itself (`jobmarket-db-1`). An orphaned
-`job-market-agent_pgdata` volume from the old project is still on disk and can be deleted.
+**Compose note:** `container_name:` was removed. It is a *global* Docker name, so a stopped container
+from an earlier run could own the name and block `up`. Compose now scopes the name itself from the
+**directory** name — the directory is still `job-market-agent`, so `docker compose config` reports
+project `job-market-agent` and the container will come up as **`job-market-agent-db-1`** (not
+`jobmarket-db-1`; only the `pyproject.toml` package name is `jobmarket`). The orphaned
+`job-market-agent_pgdata` volume is no longer a concern — the WSL Docker install has **no volumes
+at all**.
 
 **Housekeeping / tech debt:**
 - [x] Consolidated the HN client into `src/ingestion/`; fixed both package `__init__.py` files.
@@ -73,8 +110,10 @@ name and blocked `up`. Compose now scopes the name itself (`jobmarket-db-1`). An
       `pyproject.toml` + committed `uv.lock`. Direct deps only: `requests`, `psycopg[binary]`,
       `python-dotenv`. `uv sync` prunes anything undeclared — it removed a leftover `httpx`.
 - [x] Git repo bootstrapped: `main` branch, baseline commit, `.gitignore`, `.env.example` committed.
-- [x] `.gitattributes` forces LF — `core.autocrlf=true` is set globally and CRLF files break once
-      mounted into the Linux Postgres container.
+- [x] `.gitattributes` forces LF. Original reason: `core.autocrlf=true` was set globally on Windows
+      and CRLF files break once mounted into the Linux Postgres container. Since the WSL move,
+      `~/.gitconfig` has `core.autocrlf=input` (correct for Linux), so this is now belt-and-braces
+      rather than load-bearing — keep it, since the repo is still cloned on Windows sometimes.
 - [x] `.env` has `POSTGRES_PASSWORD`; `DEEPSEEK_API_KEY` placeholder in `.env.example` for Phase 2.
 - [x] `hn_client.py` split string literal (`"objec" "tID"`) rejoined; still resolves the thread.
 - [x] ruff + mypy in the `dev` dependency group (ruff excludes `*.md` so it leaves the aligned
@@ -85,16 +124,26 @@ name and blocked `up`. Compose now scopes the name itself (`jobmarket-db-1`). An
       `disallow_untyped_defs = true`.
 - [x] `ruff format` applied to `hn_client.py`; all four files now report "already formatted".
       Adopting it repo-wide is therefore free — no reformat churn pending.
-- [ ] **Tooling gotcha:** `.venv/Scripts/mypy.exe` is a broken uv trampoline (`failed to
-      canonicalize script path`). Use `uv run python -m mypy src`. `ruff.exe` works fine.
+- [x] **Tooling gotcha (resolved by the WSL move):** `.venv/Scripts/mypy.exe` was a broken uv
+      trampoline (`failed to canonicalize script path`). That was a Windows-only uv bug; the venv is
+      now Linux-side and plain `uv run mypy src` works. No workaround needed.
 - [ ] `init/` is empty, and git does not track empty directories — so a fresh clone has no `init/`,
-      Docker auto-creates it, and `CREATE EXTENSION vector` runs nowhere. Add
-      `init/001_extensions.sql` before Phase 3 or pgvector will fail confusingly.
+      Docker auto-creates it empty, and `CREATE EXTENSION vector` runs nowhere. Add
+      `init/001_extensions.sql` with `CREATE EXTENSION IF NOT EXISTS vector;` before Phase 3 or
+      pgvector will fail confusingly. **Now is the cheap moment:** there is no `pgdata` volume, so
+      the next `docker compose up -d` is a genuine first boot and the entrypoint *will* run it.
+      Once the volume exists it silently never runs again.
+- [ ] No `tests/` directory and `pytest` is not a declared dep. Phase 2 needs both — `uv add --dev
+      pytest` when the loader lands.
+- [ ] Config is not centralized: `load.py` imports `os` and `load_dotenv` but never calls either,
+      and nothing anywhere reads `DATABASE_URL`. All three `.env.example` keys are currently unread
+      by Python (`POSTGRES_PASSWORD` is consumed only by `docker-compose.yml`). Fold into a
+      `config.py` when the psycopg half lands, rather than sprinkling `os.getenv`.
 
 **Git — ongoing across every phase:**
 - [ ] Every feature: branch → PR → self-review → merge (no direct commits to `main`)
-      — **not yet honoured**: all three commits so far went straight to `main`. Start with the
-      loader on a branch.
+      — **still not honoured**: all **five** commits went straight to `main`, and there is no
+      `feat/loader` branch (it was never created). Start with the loader on a branch.
 - [ ] Commit early and often (lesson: mid-session revert on cv-tailor-ru)
 
 ## Phase 1 — Ingestion (no LLM calls) ← IN PROGRESS
@@ -111,13 +160,21 @@ name and blocked `up`. Compose now scopes the name itself (`jobmarket-db-1`). An
         on a missing key, never on a present `null`.
 - [ ] Remotive client
 - [~] `raw_postings` schema + loader with dedup
-  - [x] DDL `db/schema/001_raw_postings.sql` — applied clean, re-apply is a no-op. Verified: the
-        guarded upsert gives `INSERT 0 1` / `0 0` / `0 1`, `(remotive, test-1)` inserts alongside
-        `(hn, test-1)`, and all five constraints reject bad rows (bad source, mid-month
-        `thread_month`, HN without a month, blank text, manual `id`).
+  - [x] DDL `db/schema/001_raw_postings.sql` — written and previously verified: the guarded upsert
+        gave `INSERT 0 1` / `0 0` / `0 1`, `(remotive, test-1)` inserted alongside `(hn, test-1)`,
+        and all five constraints rejected bad rows (bad source, mid-month `thread_month`, HN without
+        a month, blank text, manual `id`). **Re-apply needed** — that verification lived in the
+        pre-WSL `pgdata` volume, which no longer exists. The DDL itself is sound; re-applying is
+        a no-op by design.
+        *Schema note:* the table has `ingested_at` + `updated_at` but deliberately **no**
+        `posted_at` — `thread_month` carries the temporal signal for HN. Revisit if Remotive turns
+        out to expose a real per-posting publish date.
   - [~] loader: idempotent upsert on `(source, external_id)` — SQL verified by hand in psql;
-        `load.py` skeleton written (fetch → rows → print works, 276 rows). The `psycopg` half and
-        the row/column mapping are still wrong — see the numbered flow above.
+        `load.py` skeleton written (fetch → rows → print works, 276 rows). The `psycopg` half is
+        unwired: `UPSERT_SQL` is defined but never executed, there is no `connect()` call, and
+        `psycopg` is an unused import. See the numbered flow above for the `42P10` conflict-target
+        bug. Also `load.py:40` rebinds `thread_to_rows` over the function it just called (5 mypy
+        errors), and `thread_to_rows[2]` will `IndexError` on a thread with fewer than 3 comments.
 - [ ] Target: ~700 raw postings loaded
 - [ ] Collect gold-set candidates while ingesting (copy ~30 deliberately messy HN posts aside)
 
@@ -144,9 +201,24 @@ catch fabrication.
 
 ## Phase 3 — Storage + retrieval
 
-*Concept (interview material — don't rush):* what an embedding vector is, cosine similarity, why
-384-dim; why semantic search finds "k8s" for the query "kubernetes"; what pgvector adds to Postgres
-and how HNSW/IVF differs from a brute-force scan.
+*Concept (interview material — don't rush):* what an embedding vector is, cosine similarity, what
+the dimension count buys you; why semantic search finds "k8s" for the query "kubernetes"; what
+pgvector adds to Postgres and how HNSW/IVF differs from a brute-force scan.
+
+**Open decision — which embedding model, and therefore which `vector(n)`.** The README and the
+draft `posting_embeddings` DDL both say `BAAI/bge-small-en-v1.5` via sentence-transformers at
+**384-dim**. But the WSL environment already has Ollama serving **`bge-m3` at 1024-dim**, and no
+sentence-transformers dependency is declared. These are incompatible: the column type is fixed at
+index time and the model must match at query time, so switching later means a re-embed and an
+`ALTER TABLE`. Decide **before** writing `embed.py`:
+
+- *Ollama + `bge-m3` (1024)* — already installed and reachable, no new Python deps, GPU-backed on the
+  Windows host. Adds a cross-boundary network hop and a runtime dependency on Ollama being up.
+- *sentence-transformers + `bge-small-en-v1.5` (384)* — in-process, no network, smaller index, matches
+  the documented design. Adds a heavy dep (torch) and runs on WSL CPU.
+
+Whichever wins, update the README stack table, the `posting_embeddings` DDL, and the Phase 3 concept
+note together so the three stop disagreeing.
 
 - [ ] Embedding pipeline — decide what text gets embedded (raw vs. structured summary; likely the
       structured summary) and document why

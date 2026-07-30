@@ -119,7 +119,7 @@ db/schema/             # numbered, re-runnable DDL migrations (001_raw_postings.
 src/
   ingestion/
     hn_client.py       # Algolia HN client: find thread → fetch top-level comments (HNThread)
-    load.py            # upsert raw postings into Postgres (idempotent) — not yet written
+    load.py            # upsert raw postings into Postgres (idempotent) — in progress
 docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log
   PROMPT.md            # paste-to-start session kickoff brief

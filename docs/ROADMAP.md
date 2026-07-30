@@ -5,7 +5,14 @@ ingestion → LLM extraction + evals → storage/retrieval → agent → serving
 earlier ones. The pure retrieval + agent lab lives in **product-search**; see
 [out of scope](#deliberately-out-of-scope-lives-in-product-search).
 
-## Build status (updated 2026-07-27)
+## Working style (for AI-assisted sessions)
+
+- **Short, structured answers.** Numbered flow or bullets, not prose walls. Actionable steps first,
+  rationale only where a decision hinges on it.
+- I write the code; the assistant guides, reviews, and verifies (read + run before assessing).
+- Paste errors, not fixes. No silent edits to project files.
+
+## Build status (updated 2026-07-28)
 
 **Working now:** `docker-compose.yml` (Postgres 17 + pgvector, healthcheck, `pgdata` volume,
 `init/` mounted). `db/schema/001_raw_postings.sql` applied and verified. `hn_client.py` is
@@ -34,9 +41,26 @@ client returns `created_at` as the **raw ISO string**; `load.py` owns the trunca
 timestamp, and a name that promises a month would read as correct in review while being wrong.
 `raw_postings_thread_month_is_month_start` is the backstop if the loader ever forgets.
 
-**Next step:** write `load.py` — parse `thread.created_at` → `.date().replace(day=1)`, map each
-`HNComment` to `(source='hn', external_id, raw_text, thread_month)`, and run the already-verified
-guarded upsert through `psycopg`.
+**In progress — `load.py` flow** (skeleton written 2026-07-28; runs end-to-end, DB half unwired):
+
+1. [x] Pre-flight: `docker compose up -d`, `DATABASE_URL` in `.env`, branch `feat/loader`.
+2. [x] `to_thread_month(created_at: str) -> date` — `fromisoformat` (handles the `Z`), stay in UTC,
+   `.date().replace(day=1)`. Returns `date(2026, 7, 1)`; mypy clean.
+3. [~] `thread_to_rows(thread) -> list[tuple]` — emits `(source, external_id, raw_text,
+   thread_month)`, month derived once outside the loop; mypy clean. *One bug left: `source` is
+   `"HN"`, but the CHECK is `source IN ('hn', …)`.* Throwaway when Remotive lands.
+4. [ ] `UPSERT_SQL` — write it in psql by hand first. *Current draft names `title`/`created_at`/
+   `text` (none exist), omits `source`, and conflicts on `(external_id)` where the unique
+   constraint is `(source, external_id)`.*
+5. [ ] `upsert_postings(conn, rows) -> LoadStats` — source-agnostic, reused by Remotive. Caller
+   owns the transaction. Returns counts; does not print.
+6. [x] `__main__`: find thread → fetch → rows → print. Verified: 276 rows off the July 2026 thread.
+   Still needs the upsert + count output wired in.
+7. [ ] Verify: run twice → `N/0/0` then `0/0/N`. Then hand-edit one `raw_text` in psql → `0/1/N-1`.
+
+Gotchas: `DO UPDATE` must set `updated_at = now()` (no trigger exists); count via
+`RETURNING (xmax = 0)` — a suppressed guarded update returns *no row*, so `unchanged = len(rows) -
+returned`; `with psycopg.connect()` commits on clean exit (not autocommit); `%s` placeholders only.
 
 **Compose note:** `container_name:` was removed. It is a *global* Docker name, so after the project
 directory was renamed (`job-market-agent` → `jobmarket`) the old stopped container still owned the
@@ -91,8 +115,9 @@ name and blocked `up`. Compose now scopes the name itself (`jobmarket-db-1`). An
         guarded upsert gives `INSERT 0 1` / `0 0` / `0 1`, `(remotive, test-1)` inserts alongside
         `(hn, test-1)`, and all five constraints reject bad rows (bad source, mid-month
         `thread_month`, HN without a month, blank text, manual `id`).
-  - [ ] loader: idempotent upsert on `(source, external_id)` — SQL verified, needs wiring in
-        `load.py` with `psycopg`
+  - [~] loader: idempotent upsert on `(source, external_id)` — SQL verified by hand in psql;
+        `load.py` skeleton written (fetch → rows → print works, 276 rows). The `psycopg` half and
+        the row/column mapping are still wrong — see the numbered flow above.
 - [ ] Target: ~700 raw postings loaded
 - [ ] Collect gold-set candidates while ingesting (copy ~30 deliberately messy HN posts aside)
 

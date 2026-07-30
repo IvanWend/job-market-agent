@@ -8,19 +8,15 @@ ALGOLIA_ITEM_URL = "https://hn.algolia.com/api/v1/items"
 
 @dataclass(frozen=True)
 class HNComment:
-    """One top-level comment on a hiring thread — i.e. one job posting."""
-
-    id: str  # comment id as TEXT; becomes raw_postings.external_id
-    text: str  # HTML, verbatim — stripping is extraction's job, not ingestion's
+    id: str  
+    text: str
 
 
 @dataclass(frozen=True)
 class HNThread:
-    """A monthly "Who is hiring" thread and its postings."""
-
     story_id: str
     title: str
-    created_at: str  # raw ISO-8601 from the API; load.py derives thread_month from it
+    created_at: str
     comments: list[HNComment]
 
 
@@ -42,12 +38,6 @@ def find_latest_hiring_thread() -> tuple[str, str]:
 
 
 def fetch_thread(story_id: str) -> HNThread:
-    """Fetch a thread and its top-level comments in a single request.
-
-    /items/ returns the whole comment tree, so `children` is exactly the top-level
-    list: no pagination, no client-side depth filter, and the story's own metadata
-    comes back in the same payload.
-    """
     resp = requests.get(f"{ALGOLIA_ITEM_URL}/{story_id}", timeout=30)
     resp.raise_for_status()
     payload = resp.json()
@@ -69,7 +59,6 @@ def fetch_thread(story_id: str) -> HNThread:
 
 
 if __name__ == "__main__":
-    # fetch_thread reads the title itself, so the one from search is redundant here.
     story_id, _ = find_latest_hiring_thread()
     thread = fetch_thread(story_id)
     print(f"thread:   {thread.title}")

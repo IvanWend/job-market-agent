@@ -14,16 +14,18 @@ earlier ones. The pure retrieval + agent lab lives in **product-search**; see
 
 ## Build status (updated 2026-08-01)
 
-**Working now:** `hn_client.py` is **complete**: `find_latest_hiring_thread()` resolves the newest
-thread via `search_by_date`, and `fetch_thread(story_id)` returns a typed `HNThread` with its
-top-level comments. `load.py` is **also complete** — idempotent upsert verified against 276 real
-HN postings. Toolchain is uv + ruff + mypy, all three clean. Repo is on git (`main`, level with
-`origin/main`), but `docker-compose.yml`, `load.py`, and `init/` are uncommitted as of this update.
+**Working now:** all three ingestion clients are **complete** — `hn_client.py`, `remotive_client.py`,
+and `adzuna_client.py` (pulled forward from Phase 5; see Phase 1 below) — plus `load.py`, which
+fetches all three, converts each to `(source, external_id, raw_text, thread_month)` rows, and
+idempotently upserts them. Toolchain is uv + ruff + mypy, all clean. Repo is on git (`main`, level
+with `origin/main`), but `load.py`, `init/`, `remotive_client.py`, and `adzuna_client.py` are
+uncommitted as of this update.
 
 **Running now:** the database, fully (re-)provisioned in the new WSL2 Docker install.
 `init/001_extensions.sql` bootstrapped `vector` + `pg_trgm` on first boot, `001_raw_postings.sql`
-is re-applied and verified, and the loader has round-tripped 276 real HN postings with idempotency
-confirmed (see the `load.py` flow section below).
+is applied and verified, and the loader has round-tripped all three sources for real:
+**2,807 postings loaded** (276 HN + 34 Remotive + 2,497 Adzuna) — past the ~700 target (see the
+`load.py` flow section below).
 
 **Done — `load.py` flow** (skeleton written 2026-07-28; DB half landed and verified 2026-08-01):
 
@@ -55,6 +57,29 @@ file or directory`). The connection string has to be passed explicitly
 (`os.environ.get("DATABASE_URL")`). Also: `with psycopg.connect(...) as conn:` already
 commits/rolls back the whole block on exit, so wrapping it in an extra `conn.transaction()` is a
 redundant nested transaction — harmless, just an unnecessary layer.
+
+**Remotive + Adzuna additions (2026-08-01):** `remotive_to_rows`/`adzuna_to_rows` mirror
+`thread_to_rows`'s shape, but `raw_text` is `json.dumps(job)`, not verbatim prose — first draft used
+`str(job)` (Python repr: single quotes, `None`/`True`), which isn't valid JSON and would have broken
+Phase 2 parsing. `thread_month` is deliberately repurposed for both non-HN sources too — derived
+from each posting's own date, not just an HN thread reference — even though the schema comment
+predates that decision and only literally requires non-null for `hn`.
+
+Adzuna needed real pagination: the bare endpoint only returns page 1 (10 results) by default even
+when thousands match, so `results_per_page=50` plus a page loop was required. `category="it-jobs"`
+was chosen over a fixed keyword to stay in-domain (tech, matching HN/Remotive) while maximizing
+volume — 461k+ available vs. ~18k for a single keyword like `"python developer"`, and unlike a
+keyword list it doesn't require enumerating role titles.
+
+Bugs caught along the way: an unaliased `fetch_latest_jobs` import let `load.py` silently call
+Remotive's client with Adzuna's kwargs (`TypeError`) — fixed by aliasing both imports
+(`fetch_remotive_jobs`, `fetch_adzuna_jobs`); `category="it"` isn't a real Adzuna slug (400) — the
+real one is `it-jobs`; the page-exhaustion check must test the `results` list's *content*
+(`if not results`), not just key presence — Adzuna always returns a `results` key, even when empty.
+Also added retry/backoff (3 attempts, exponential 1s/2s/4s) around `ConnectionError`/`Timeout` in
+the page loop, after a real proxy blip (`ProxyError`) killed a 50-page run at page 38 — deliberately
+does **not** retry `HTTPError`, since a 4xx/5xx already got a response and retrying a bad `category`
+value would just waste time before failing anyway.
 
 **Compose note:** `container_name:` was removed. It is a *global* Docker name, so a stopped container
 from an earlier run could own the name and block `up`. Compose now scopes the name itself from the
@@ -89,7 +114,12 @@ pre-WSL `job-market-agent_pgdata` volume is gone; the current WSL Docker install
   - [x] loader: idempotent upsert on `(source, external_id)` — done and verified against 276 real
         HN postings (insert → no-op re-run → single-row repair on hand-edited text). See the
         `load.py` flow above for the full verification trail.
-- [ ] Target: ~700 raw postings loaded (276 HN so far; Remotive still needed)
+- [x] Remotive client — semi-structured JSON, contrasts with HN's pure prose. Free API only ever
+      exposes ~34 currently-live postings (no historical/paginated data; `total-job-count` caps out
+      regardless of filters), so it couldn't carry the volume target alone.
+- [x] Adzuna client — pulled forward from Phase 5 for exactly that reason: real pagination + retry,
+      see the `load.py` flow section above for the full build/bug log.
+- [x] Target: ~700 raw postings loaded — **2,807 loaded** (276 HN + 34 Remotive + 2,497 Adzuna)
 - [ ] Collect gold-set candidates while ingesting (copy ~30 deliberately messy HN posts aside)
 
 ## Phase 2 — Extraction + evals
@@ -155,7 +185,7 @@ end-to-end (HTTP in → agent loop → tool calls → streamed response).
 ## Phase 5 — Polish
 
 - [ ] README with architecture diagram, eval-results table, demo GIF
-- [ ] (Optional) Adzuna source, cross-source dedup (fuzzy company+title), trend charts
+- [ ] Cross-source dedup (fuzzy company+title), trend charts
 
 ## Ownership split (what I write by hand vs. delegate)
 

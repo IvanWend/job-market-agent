@@ -94,7 +94,7 @@ pre-WSL `job-market-agent_pgdata` volume is gone; the current WSL Docker install
 
 ## Phase 2 — Extraction + evals
 
-*Known ground: LLM extraction, Pydantic, evals (cv-tailor-ru patterns).*
+*Known ground: LLM extraction, Pydantic, evals.*
 
 *Concept:* the Pydantic schema is the single contract for extraction and evals; every non-null field
 carries a **verbatim source quote**, and evals check quote-in-text containment — not just values — to

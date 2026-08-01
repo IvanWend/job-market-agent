@@ -23,9 +23,7 @@ the retrieval/agent lab is the separate **product-search** repo. Built skill-by-
 
 **Where we left off (2026-08-01):** Phase 1 (ingestion) — HN ingestion is now **done end-to-end**.
 `docker-compose.yml`, `db/schema/001_raw_postings.sql`, `src/ingestion/hn_client.py`, and
-`src/ingestion/load.py` (idempotent upsert) are all working and verified. Still on `main`, not a
-branch. **Uncommitted:** `docker-compose.yml` (port now scoped to `127.0.0.1`) and `load.py`;
-`init/` is untracked. Commit these before starting Remotive.
+`src/ingestion/load.py` (idempotent upsert) are all working and verified.
 
 **Next up (in order):**
 1. Remotive client — semi-structured JSON, the deliberate contrast with HN's pure prose.

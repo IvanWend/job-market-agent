@@ -6,8 +6,10 @@ database), and answers analytical questions about the job market — *"what skil
 backend roles"*, *"which postings match this résumé"*. Portfolio project; second after
 [cv-tailor-ru](../) (LLM résumé tailoring).
 
-**Status:** early — Phase 1 (ingestion) in progress. See [docs/ROADMAP.md](docs/ROADMAP.md) for what
-is built vs. planned, and [docs/PROMPT.md](docs/PROMPT.md) for the session-kickoff brief.
+**Status:** Phase 1 (ingestion) in progress — HN ingestion (client + idempotent loader) is done and
+verified end-to-end; Remotive client and the ~700-posting target remain. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for what is built vs. planned, and
+[docs/PROMPT.md](docs/PROMPT.md) for the session-kickoff brief.
 
 **Career signals targeted:** structured LLM extraction from unstructured text, RAG over a
 self-built corpus, agent tool-calling, eval-driven development, LLM observability, containerized
@@ -83,19 +85,18 @@ structured_postings ( id, raw_posting_id FK, extracted JSONB, model, prompt_vers
 posting_embeddings  ( posting_id FK, embedding vector(384|1024), embedded_text )  -- dim TBD
 ```
 
-Ingestion is **designed to be idempotent**: the loader upserts on `(source, external_id)` with a
-guarded `ON CONFLICT … DO UPDATE … SET updated_at = now() WHERE raw_text IS DISTINCT FROM …`, so
+Ingestion is **idempotent, verified end-to-end**: the loader upserts on `(source, external_id)` with
+a guarded `ON CONFLICT … DO UPDATE … SET updated_at = now() WHERE raw_text IS DISTINCT FROM …`, so
 re-fetching an unchanged posting is a true no-op and `updated_at` only moves when the text actually
-changes. The `UNIQUE (source, external_id)` constraint that arbitrates this is in place and the SQL
-was verified by hand in psql — but it is **not yet wired into `load.py`**, whose current draft
-conflicts on `(external_id)` alone and would fail with `42P10`. Tracked in
-[docs/ROADMAP.md](docs/ROADMAP.md).
+changes. Verified against 276 real HN postings: the first load inserts all 276, a repeat run reports
+all 276 `unchanged` with `updated_at` untouched, and hand-editing one row's text before a third run
+produces exactly one `updated` row with a fresh `updated_at`.
 
 ## Setup
 
-> Most commands below are **planned** — the project is still in Phase 1. Working today: the
-> `raw_postings` DDL and the HN client (thread lookup + comment fetch). The loader's DB half is
-> unwired, and the database is currently un-provisioned.
+> The project is still in Phase 1, but everything below is working today: `raw_postings` DDL, the
+> HN client, and the loader's DB half (idempotent upsert, verified against 276 real postings).
+> Remotive is not built yet.
 
 Developed on **WSL2 Ubuntu** with Docker Engine running natively in WSL (systemd) — *not* Docker
 Desktop. Requirements: Python 3.12+ (3.13 pinned via `.python-version`),
@@ -122,7 +123,19 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/001_raw_postings.sql
 #   POSTGRES_PASSWORD=...
 #   DATABASE_URL=postgresql://jobmarket:...@localhost:5432/jobmarket
 #   DEEPSEEK_API_KEY=sk-...
+#   (POSTGRES_PASSWORD and the password embedded in DATABASE_URL must match, or step 3+ fails
+#   with "password authentication failed")
 ```
+
+**WSL2 + mirrored networking gotcha:** if step 2 fails with `failed to bind host port ... address
+already in use`, something on the **Windows host** already owns 5432 — `networkingMode=mirrored`
+means Windows and WSL share the port space. Check `Get-Service *postgres*` in PowerShell; a native
+Postgres install (even one not obviously running as "a service" at a glance) is the likely culprit.
+Also: if that first `up` fails mid-bind, the container can be left with a broken network sandbox
+even after a *later* `docker compose up -d` reports success and the healthcheck goes green —
+`NetworkSettings.Networks`/`.Ports` end up empty and the host can't reach it at all. Fix with
+`docker compose down && docker compose up -d` to force a real recreate, not a `start` of the
+already-broken container.
 
 Step 3 uses the host `psql` directly rather than `docker compose exec` — one less indirection, and
 it proves `DATABASE_URL` actually works before the loader depends on it.
@@ -141,7 +154,7 @@ pyproject.toml         # deps (uv) + ruff/mypy config; uv.lock is committed
 .gitattributes         # force LF (files cross into the Linux Postgres container)
 docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume, ./init mount
 db/schema/             # numbered, re-runnable DDL applied by hand (001_raw_postings.sql, …)
-init/                  # NOT YET CREATED — first-boot bootstrap only (CREATE EXTENSION vector)
+init/                  # first-boot bootstrap only — vector + pg_trgm (untracked by git; needs `git add`)
 src/
   ingestion/
     hn_client.py       # Algolia HN client: find thread → fetch top-level comments (HNThread)

@@ -1,22 +1,35 @@
 import json
+import logging
 import os
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 import psycopg
 from dotenv import load_dotenv
 
-from src.ingestion.hn_client import HNThread, fetch_thread, find_latest_hiring_thread
-from src.ingestion.remotive_client import REMOTIVE_ENDPOINT_URL, fetch_latest_jobs as fetch_remotive_jobs
-from src.ingestion.adzuna_client import ADZUNA_ENDPOINT_URL, fetch_latest_jobs as fetch_adzuna_jobs
+from src.ingestion.adzuna_client import ADZUNA_ENDPOINT_URL
+from src.ingestion.adzuna_client import fetch_latest_jobs as fetch_adzuna_jobs
+from src.ingestion.hn_client import HNThread, find_hiring_threads, fetch_thread
+from src.ingestion.remotive_client import (
+    REMOTIVE_ENDPOINT_URL,
+)
+from src.ingestion.remotive_client import (
+    fetch_latest_jobs as fetch_remotive_jobs,
+)
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+HN_BACKFILL_SINCE = date(2023, 1, 1)
+HN_BACKFILL_UNTIL = date(2023, 12, 31)
+
 UPSERT_SQL = """
-INSERT INTO raw_postings (source, external_id, raw_text, thread_month)
-VALUES (%s, %s, %s, %s)
+INSERT INTO raw_postings (source, external_id, raw_text, thread_month, posted_at)
+VALUES (%s, %s, %s, %s, %s)
 ON CONFLICT (source, external_id) DO UPDATE
   SET raw_text   = EXCLUDED.raw_text,
+      posted_at  = EXCLUDED.posted_at,
       updated_at = now()
   WHERE raw_postings.raw_text IS DISTINCT FROM EXCLUDED.raw_text
 RETURNING (xmax = 0) AS inserted;
@@ -30,34 +43,50 @@ class LoadStats:
     unchanged: int
 
 
-def to_thread_month(created_at: str) -> date:
+def to_posted_at(created_at: str) -> datetime:
     dt = datetime.fromisoformat(created_at)
-    return dt.date().replace(day=1)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
 
 
-def hnthread_to_rows(thread: HNThread) -> list[tuple[str, str, str, date]]:
-    thread_month = to_thread_month(thread.created_at)
-    rows: list[tuple[str, str, str, date]] = []
+def to_thread_month(posted_at: datetime) -> date:
+    return posted_at.date().replace(day=1)
+
+
+Row = tuple[str, str, str, date, datetime]
+
+
+def hnthread_to_rows(thread: HNThread) -> list[Row]:
+    thread_month = to_thread_month(to_posted_at(thread.created_at))
+    rows: list[Row] = []
     for comment in thread.comments:
-        rows.append(("hn", comment.id, comment.text, thread_month))
+        posted_at = to_posted_at(comment.created_at)
+        rows.append(("hn", comment.id, comment.text, thread_month, posted_at))
     return rows
 
 
-def remotive_to_rows(jobs: list[dict]) -> list[tuple[str, str, str, date]]:
-    rows: list[tuple[str, str, str, date]] = []
+def fetch_hn_rows(since: date, until: date) -> list[Row]:
+    threads_meta = find_hiring_threads(since=since, until=until)
+    threads = [fetch_thread(story_id) for story_id, _ in threads_meta]
+    return [row for thread in threads for row in hnthread_to_rows(thread)]
+
+
+def remotive_to_rows(jobs: list[dict]) -> list[Row]:
+    rows: list[Row] = []
     for job in jobs:
-        created_at = job["publication_date"]
-        thread_month = to_thread_month(created_at)
-        rows.append(("remotive", job["id"], json.dumps(job), thread_month))
+        posted_at = to_posted_at(job["publication_date"])
+        thread_month = to_thread_month(posted_at)
+        rows.append(("remotive", job["id"], json.dumps(job), thread_month, posted_at))
     return rows
 
 
-def adzuna_to_rows(jobs: list[dict]) -> list[tuple[str, str, str, date]]:
-    rows: list[tuple[str, str, str, date]] = []
+def adzuna_to_rows(jobs: list[dict]) -> list[Row]:
+    rows: list[Row] = []
     for job in jobs:
-        created_at = job["created"]
-        thread_month = to_thread_month(created_at)
-        rows.append(("adzuna", job["id"], json.dumps(job), thread_month))
+        posted_at = to_posted_at(job["created"])
+        thread_month = to_thread_month(posted_at)
+        rows.append(("adzuna", job["id"], json.dumps(job), thread_month, posted_at))
     return rows
 
 
@@ -65,8 +94,12 @@ def upsert_posting(conn, rows) -> LoadStats:
     inserted = updated = 0
     with conn.cursor() as cur:
         for row in rows:
-            cur.execute(UPSERT_SQL, row)
-            result = cur.fetchone()
+            try:
+                cur.execute(UPSERT_SQL, row)
+                result = cur.fetchone()
+            except psycopg.Error:
+                logger.exception("upsert failed for %s/%s", row[0], row[1])
+                continue
             if result is None:
                 continue
             elif result[0]:
@@ -78,32 +111,38 @@ def upsert_posting(conn, rows) -> LoadStats:
 
 
 if __name__ == "__main__":
-    story_id, _ = find_latest_hiring_thread()
-    thread: HNThread = fetch_thread(story_id)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
-    hn_posting_rows = hnthread_to_rows(thread)
-    print(f"Fetched {len(hn_posting_rows)} postings from HN.")
+    hn_posting_rows = fetch_hn_rows(HN_BACKFILL_SINCE, HN_BACKFILL_UNTIL)
+    logger.info("Fetched %d postings from Hacker News.", len(hn_posting_rows))
 
     remotive_jobs = fetch_remotive_jobs(REMOTIVE_ENDPOINT_URL)
     remotive_posting_rows = remotive_to_rows(remotive_jobs)
-    print(f"Fetched {len(remotive_posting_rows)} postings from Remotive.")
+    logger.info("Fetched %d postings from Remotive.", len(remotive_posting_rows))
 
-    adzuna_jobs = fetch_adzuna_jobs(url=ADZUNA_ENDPOINT_URL, keywords="python developer", category="it-jobs", country="us")
+    adzuna_jobs = fetch_adzuna_jobs(
+        url=ADZUNA_ENDPOINT_URL, keywords="python developer", category="it-jobs", country="us"
+    )
     adzuna_posting_rows = adzuna_to_rows(adzuna_jobs)
-    print(f"Fetched {len(adzuna_posting_rows)} postings from Adzuna.")
+    logger.info("Fetched %d postings from Adzuna.", len(adzuna_posting_rows))
 
-
-    db_url = os.environ.get("DATABASE_URL")
+    db_url = os.environ["DATABASE_URL"]
 
     try:
         with psycopg.connect(db_url) as conn:
-            print("Ingesting data into raw_postings...")
-            stats = upsert_posting(conn, hn_posting_rows + remotive_posting_rows + adzuna_posting_rows)
+            logger.info("Ingesting data into raw_postings...")
+            stats = upsert_posting(
+                conn, hn_posting_rows + remotive_posting_rows + adzuna_posting_rows
+            )
 
-            print("\n--- Ingestion Results ---")
-            print(f"Inserted: {stats.inserted}")
-            print(f"Updated:  {stats.updated}")
-            print(f"Unchanged: {stats.unchanged}")
-    except Exception as e:
-        print(f"Ingestion failed: {e}")
+            logger.info(
+                "Ingestion results — inserted: %d, updated: %d, unchanged: %d",
+                stats.inserted,
+                stats.updated,
+                stats.unchanged,
+            )
+    except Exception:
+        logger.exception("Ingestion failed")
         raise

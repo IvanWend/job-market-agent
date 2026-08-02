@@ -1,15 +1,19 @@
+import logging
 import os
 import time
+
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 ADZUNA_ENDPOINT_URL = "https://api.adzuna.com/v1/api/jobs/{country}/search/{page}"
 
 
 def fetch_latest_jobs(
-    url: str, keywords=None, category=None, max_pages=50, country="us", max_retries=3
+    url: str, keywords=None, category=None, max_pages=10, country="us", max_retries=3
 ) -> list[dict]:
     params = {
         "app_id": os.environ.get("ADZUNA_APP_ID"),
@@ -37,7 +41,7 @@ def fetch_latest_jobs(
                 if attempt == max_retries - 1:
                     raise
                 wait = 2**attempt
-                print(f"Adzuna page {page} failed ({e}), retrying in {wait}s...")
+                logger.warning("Adzuna page %d failed (%s), retrying in %ds...", page, e, wait)
                 time.sleep(wait)
 
         data = resp.json()
@@ -45,6 +49,7 @@ def fetch_latest_jobs(
         if not results:
             break
         all_jobs.extend(results)
+
         time.sleep(1)
 
     return all_jobs
@@ -52,10 +57,10 @@ def fetch_latest_jobs(
 
 if __name__ == "__main__":
     job_objects = fetch_latest_jobs(
-        url=ADZUNA_ENDPOINT_URL, 
+        url=ADZUNA_ENDPOINT_URL,
         keywords="python developer",
         category="it-jobs",
-        max_pages=50, 
-        country="us"
+        max_pages=10,
+        country="us",
     )
     print(f"Process complete. Gathered {len(job_objects)} total jobs.")

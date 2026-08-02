@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, time
 
 import requests
 
@@ -10,6 +11,7 @@ ALGOLIA_ITEM_URL = "https://hn.algolia.com/api/v1/items"
 class HNComment:
     id: str
     text: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -18,6 +20,34 @@ class HNThread:
     title: str
     created_at: str
     comments: list[HNComment]
+
+
+def find_hiring_threads(since: date, until: date) -> list[tuple[str, str]]:
+    since_ts = int(datetime.combine(since, time.min, tzinfo=UTC).timestamp())
+    until_ts = int(datetime.combine(until, time.min, tzinfo=UTC).timestamp())
+    params: dict[str, str | int] = {
+        "query": "who is hiring",
+        "tags": "story,author_whoishiring",
+        "hitsPerPage": 50,
+        "numericFilters": f"created_at_i>{since_ts},created_at_i<{until_ts}",
+    }
+
+    threads: list[tuple[str, str]] = []
+    page = 0
+    while True:
+        resp = requests.get(ALGOLIA_SEARCH_URL, params={**params, "page": page}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for hit in data["hits"]:
+            if "who is hiring" in hit["title"].lower():
+                threads.append((hit["objectID"], hit["title"]))
+
+        page += 1
+        if page >= data["nbPages"]:
+            break
+
+    return threads
 
 
 def find_latest_hiring_thread() -> tuple[str, str]:
@@ -46,9 +76,10 @@ def fetch_thread(story_id: str) -> HNThread:
     for child in payload["children"]:
         # Deleted comments carry a null `text`; blank ones are not postings either.
         text = (child.get("text") or "").strip()
+        created_at = child.get("created_at") or ""
         if not text:
             continue
-        comments.append(HNComment(id=str(child["id"]), text=text))
+        comments.append(HNComment(id=str(child["id"]), text=text, created_at=created_at))
 
     return HNThread(
         story_id=story_id,

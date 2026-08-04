@@ -22,65 +22,33 @@ learn.
 - Watch my token budget: prefer a fresh session per phase over dragging a long context around, and
   say so when a wrap-up + new session is the cheaper move.
 
-**Where we left off (2026-08-03):** Phase 1 (ingestion) is **done end-to-end**, the corpus
-composition problem is **fixed**, and all of that is **committed** (`6c83bc1`). **7,162 postings
-loaded** — HN 4,452 (62.2%), Adzuna 2,676 (37.4%), Remotive 34 (0.5%). That ratio was 89.6% Adzuna /
-9.2% HN / 1.1% Remotive two sessions ago; it inverted the project's premise (Phase 2 exists to prove
-LLM extraction from messy prose, and messy prose was a tenth of the data). Fixed by adding
-`find_hiring_threads(since, until)` to `hn_client.py` and backfilling all of 2023's HN threads (12
-months, 4,176 rows) — Remotive's free API only ever exposes ~34 live postings so it can't carry
-volume, and Adzuna's growth was capped (`max_pages` 50→10) so it stops dominating every re-run.
-
-Also committed: a `posted_at TIMESTAMPTZ` column (`002_posted_at.sql`) — `thread_month` was
-overloaded as the only temporal signal for all three sources. Adzuna/Remotive backfilled from their
-own JSON via SQL; HN captures `posted_at` per-comment going forward (`HNComment.created_at`). **276
-old HN rows (from before this column existed) still have `posted_at IS NULL`** — recoverable
-(Algolia's item API returns `created_at` per comment ID; sketch exists), not yet run. And `load.py`/
-`adzuna_client.py` now use stdlib `logging` instead of `print`, with `upsert_posting` logging-and-
-continuing on a bad row instead of the whole batch dying blind.
-
-**Gold-set tooling started, not yet run for real.** `evals/test.py` is an interactive CLI: loads a
-candidates JSON, shows each posting's `raw_text`, `y`/`n`/`q` to accept, saves incrementally to
-`evals/gold_30.json`, dedupes on `(source, external_id)` (not `external_id` alone — sources can
-collide there per the schema's own uniqueness constraint). `evals/candidates_hn.json` (40 random HN
-postings, exported with `source` field included) already exists. **`evals/` is untracked — nothing
-committed yet, including `test.py` itself.** Next session: run the review (`uv run python
-evals/test.py evals/candidates_hn.json`), pick ~15 messy ones, then export+review Adzuna (~10) and
-Remotive (~5) candidates the same way (SQL pattern for cross-source-safe exports is in chat history
-if not restated below). Decide then whether `candidates_*.json` should be gitignored (regenerable
-from SQL) while `test.py` gets committed for real.
+**Where we left off (2026-08-04):** Phase 1 (ingestion) is **done, committed, and pushed**.
+**7,162 postings loaded** (HN 4,452 / Adzuna 2,676 / Remotive 34) across all three sources, with a
+`posted_at` timestamp per row. Gold-set candidates are selected: 10 each from HN/Adzuna/Remotive,
+picked via random sampling (`evals/generate_gold_dataset.py`, parameterized `psycopg` queries — not
+hand-curated for messiness), sitting in `evals/gold_30_candidates.json` (gitignored, regenerable).
+**Tomorrow starts Phase 2.**
 
 **Next up (in order):**
-1. Run the gold-set review session (`evals/test.py`) across all three sources — the actual labeling
-   still can't happen until the schema exists (next item), but candidate *selection* can finish now.
-2. Phase 2: finalize the Pydantic extraction schema (open questions logged in ROADMAP.md) — unblocks
-   hand-labeling `evals/gold_30.json`.
-3. Optional, low priority: backfill `posted_at` for the 276 old HN rows.
+1. Finalize the Pydantic extraction schema (open questions logged in ROADMAP.md).
+2. Hand-label the 30 gold-set candidates against that schema.
+3. Build the extraction pipeline + eval script.
 
 **Watch out:**
-- Docker needs no babysitting — it is a systemd service, `enabled` at boot, and the user is in the
-  `docker` group (no `sudo`) — but stopping the rogue Windows Postgres service *did* need an
-  elevated PowerShell (`Start-Process -Verb RunAs`).
-- `uv run mypy src` works directly; the broken `.venv/Scripts/mypy.exe` trampoline was a
-  Windows-only uv bug and no longer applies.
-- Proxy: `~/.proxy.env` is the single source of truth (`autoProxy=false`). Never put globs (`127.*`,
-  `<local>`) in `no_proxy` — curl tolerates them, `requests`/`httpx` do not, and localhost calls
-  then silently route through the proxy. The Docker **daemon** proxy is a separate scope in
-  `/etc/systemd/system/docker.service.d/`. It's also flaky on long-running loops against external
-  hosts — a real run died mid-`adzuna_client.py` page loop on a dropped proxy connection; retry/
-  backoff there now absorbs it.
-- `adzuna_client.py`'s retry logic still only catches `ConnectionError`/`Timeout` — a 429 or 5xx
-  raises `HTTPError` uncaught and kills the whole `load.py` run (HN/Remotive rows included, since
-  they're inserted after Adzuna's fetch completes). Flagged, not fixed.
-- Checked cross-source dedup (Adzuna/Remotive overlap) via `pg_trgm` — zero matches found. Not worth
-  building dedup logic on current evidence; re-check post-Phase-2 with real embeddings instead of
-  trusting this as final.
-- ROADMAP.md has stale/contradictory notes: "Remotive client" checked off in one place, unchecked in
-  another; a note about revisiting Remotive's publish date that's already resolved. Not cleaned up.
-- `hn_client.py`, `remotive_client.py`, and `adzuna_client.py` docstrings/comments were removed
-  deliberately across all three; don't flag it again.
-- Untracked junk in the tree: `.claude/settings.json` (`.gitignore` only covers
-  `.claude/settings.local.json`).
+- Docker needs no babysitting — systemd service, enabled at boot, user is in the `docker` group. A
+  rogue Windows Postgres service on the same port has bitten this before — if `docker compose up`
+  fails to bind 5432, check `Get-Service *postgres*` in an elevated PowerShell.
+- Proxy: `~/.proxy.env` is the single source of truth. Never put globs (`127.*`, `<local>`) in
+  `no_proxy` — `requests`/`httpx` don't honor them the way `curl` does, and localhost calls silently
+  route through the proxy.
+- `adzuna_client.py`'s retry logic only catches `ConnectionError`/`Timeout` — a 429 or 5xx still
+  kills the whole `load.py` run. Known, not fixed.
+- 276 old HN rows predate the `posted_at` column and are still `NULL` there — low priority, fix
+  sketch was worked out if it ever matters.
+- The gold-set's random (not hand-curated) selection is a real quality tradeoff — worth revisiting
+  if Phase 2 eval accuracy looks off and the postings themselves turn out to be too easy/uniform.
+- `hn_client.py`, `remotive_client.py`, and `adzuna_client.py` have no docstrings/comments —
+  deliberate, don't flag it again.
 
 Start by checking the current state of the repo in case I've changed things since.
 

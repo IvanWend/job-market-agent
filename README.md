@@ -6,8 +6,9 @@ database), and answers analytical questions about the job market — *"what skil
 backend roles"*, *"which postings match this résumé"*. Portfolio project; second after
 [cv-tailor-ru](../) (LLM résumé tailoring).
 
-**Status:** Phase 1 (ingestion) in progress — HN ingestion (client + idempotent loader) is done and
-verified end-to-end; Remotive client and the ~700-posting target remain. See
+**Status:** Phase 1 (ingestion) **done** — HN, Remotive, and Adzuna clients plus the idempotent
+loader are all working and verified. **7,162 postings loaded** (HN 4,452, Adzuna 2,676, Remotive
+34). Gold-set candidates selected; Phase 2 (extraction + evals) starts next. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is built vs. planned, and
 [docs/PROMPT.md](docs/PROMPT.md) for the session-kickoff brief.
 
@@ -18,7 +19,7 @@ deployment.
 ## How it works
 
 ```
-INGESTION    HN "Who is Hiring" (Algolia API) + Remotive API  ──►  raw_postings (Postgres)
+INGESTION    HN "Who is Hiring" (Algolia) + Remotive + Adzuna APIs ──►  raw_postings (Postgres)
 EXTRACTION   LLM + Pydantic schema, grounded by verbatim quotes ──►  structured_postings
 STORAGE      Postgres + pgvector; local bge-small-en-v1.5 embeddings ──►  posting_embeddings
 AGENT        DeepSeek tool-calling loop: sql_query · vector_search · resume_match
@@ -26,9 +27,10 @@ SERVING      FastAPI (SSE streaming) · Langfuse tracing · Docker Compose
 ```
 
 The design contrast that makes the project a good demo: **HN postings are pure unstructured prose**
-(hardest extraction target), **Remotive is semi-structured JSON** — normalizing both into one schema
-is the point. Every non-null extracted field carries a **verbatim source quote** so evals can check
-grounding and catch fabrication (lesson carried from cv-tailor-ru).
+(hardest extraction target), **Remotive/Adzuna are semi-structured JSON** — normalizing all three
+into one schema is the point, and Adzuna's own structured fields (salary, category) double as free
+eval ground truth. Every non-null extracted field carries a **verbatim source quote** so evals can
+check grounding and catch fabrication (lesson carried from cv-tailor-ru).
 
 ## Tech stack
 
@@ -47,9 +49,13 @@ grounding and catch fabrication (lesson carried from cv-tailor-ru).
 ## Data sources
 
 - **HN "Who is Hiring" (primary)** — monthly threads via the free Algolia HN API
-  (`hn.algolia.com/api/v1`); top-level comments are job postings, pure prose. No auth.
+  (`hn.algolia.com/api/v1`); top-level comments are job postings, pure prose. No auth. Backfilled
+  across multiple months, not just the latest thread.
+- **Adzuna (volume)** — free key, rate-limited, paginated; carries most of the row count. Its
+  `description` field is truncated to a snippet (~1.5KB cap) by the free tier — extraction on these
+  rows legitimately nulls out fields whose evidence was in the cut-off text.
 - **Remotive (secondary)** — `remotive.com/api/remote-jobs`, free, no auth; semi-structured JSON.
-- **Adzuna (v0.3, optional)** — free key, rate-limited; adds volume + salary data.
+  The free API only ever exposes ~34 currently-live postings, no history — can't carry volume alone.
 - **Ruled out:** hh.ru (API closed Dec 2025; ToS forbids derivative DBs — do not scrape),
   LinkedIn (ToS / auth walls).
 
@@ -78,7 +84,8 @@ class Posting(BaseModel):
 ```sql
 raw_postings (
   id BIGINT IDENTITY PK, source TEXT, external_id TEXT, raw_text TEXT,
-  thread_month DATE, ingested_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ,
+  thread_month DATE, posted_at TIMESTAMPTZ, ingested_at TIMESTAMPTZ DEFAULT now(),
+  updated_at TIMESTAMPTZ,
   CHECK (source IN ('hn','remotive','adzuna')), UNIQUE (source, external_id)
 )
 structured_postings ( id, raw_posting_id FK, extracted JSONB, model, prompt_version, extracted_at )
@@ -94,9 +101,8 @@ produces exactly one `updated` row with a fresh `updated_at`.
 
 ## Setup
 
-> The project is still in Phase 1, but everything below is working today: `raw_postings` DDL, the
-> HN client, and the loader's DB half (idempotent upsert, verified against 276 real postings).
-> Remotive is not built yet.
+> Phase 1 is done — everything below is working today: `raw_postings` DDL, all three ingestion
+> clients (HN, Remotive, Adzuna), and the loader (idempotent upsert, verified end-to-end).
 
 Developed on **WSL2 Ubuntu** with Docker Engine running natively in WSL (systemd) — *not* Docker
 Desktop. Requirements: Python 3.12+ (3.13 pinned via `.python-version`),
@@ -116,8 +122,9 @@ printf 'CREATE EXTENSION IF NOT EXISTS vector;\n' > init/001_extensions.sql
 docker compose up -d
 docker compose ps                       # wait for "healthy"
 
-# 3. Apply the schema (re-runnable, so safe to repeat)
+# 3. Apply the schema (each file is re-runnable, so safe to repeat)
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/001_raw_postings.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/002_posted_at.sql
 
 # 4. .env (git-ignored) — see .env.example
 #   POSTGRES_PASSWORD=...
@@ -153,12 +160,16 @@ pyproject.toml         # deps (uv) + ruff/mypy config; uv.lock is committed
 .env.example           # committed key names, no values; .env is git-ignored
 .gitattributes         # force LF (files cross into the Linux Postgres container)
 docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume, ./init mount
-db/schema/             # numbered, re-runnable DDL applied by hand (001_raw_postings.sql, …)
-init/                  # first-boot bootstrap only — vector + pg_trgm (untracked by git; needs `git add`)
+db/schema/             # numbered, re-runnable DDL (001_raw_postings.sql, 002_posted_at.sql)
+init/                  # first-boot bootstrap only — vector + pg_trgm
 src/
   ingestion/
-    hn_client.py       # Algolia HN client: find thread → fetch top-level comments (HNThread)
-    load.py            # upsert raw postings into Postgres (idempotent) — in progress
+    hn_client.py       # Algolia HN client: find thread(s) → fetch top-level comments (HNThread)
+    remotive_client.py # Remotive API client
+    adzuna_client.py   # Adzuna API client — pagination + retry/backoff
+    load.py            # fetch all three, convert to rows, idempotent upsert into Postgres
+evals/
+  generate_gold_dataset.py  # pulls gold-set candidate rows from raw_postings
 docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log
   PROMPT.md            # paste-to-start session kickoff brief

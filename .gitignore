@@ -9,6 +9,7 @@ __pycache__/
 # Ingested data / gold-set working copies
 data/
 evals/candidates_*.json
+evals/gold_30_candidates.json
 
 # Tooling caches
 .ruff_cache/
@@ -17,6 +18,7 @@ evals/candidates_*.json
 
 # IDE / OS
 .claude/settings.local.json
+.claude/settings.json
 .vscode/
 .idea/
 Thumbs.db

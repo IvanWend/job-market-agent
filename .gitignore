@@ -8,6 +8,7 @@ __pycache__/
 
 # Ingested data / gold-set working copies
 data/
+evals/candidates_*.json
 
 # Tooling caches
 .ruff_cache/

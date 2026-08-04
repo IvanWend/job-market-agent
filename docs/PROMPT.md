@@ -22,42 +22,40 @@ learn.
 - Watch my token budget: prefer a fresh session per phase over dragging a long context around, and
   say so when a wrap-up + new session is the cheaper move.
 
-**Where we left off (2026-08-02):** Phase 1 (ingestion) is **done end-to-end**, and the corpus
-composition problem is **fixed**. `db/schema/001_raw_postings.sql` + `002_posted_at.sql`,
-`src/ingestion/hn_client.py`, `remotive_client.py`, `adzuna_client.py`, and `load.py` are all
-working and verified. **7,162 postings loaded** — HN 4,452 (62.2%), Adzuna 2,676 (37.4%), Remotive
-34 (0.5%). That ratio was 89.6% Adzuna / 9.2% HN / 1.1% Remotive as of the last session; it inverted
-the project's premise (Phase 2 exists to prove LLM extraction from messy prose, and messy prose was
-a tenth of the data). Fixed by adding `find_hiring_threads(since, until)` to `hn_client.py` and
-backfilling all of 2023's HN threads (12 months, 4,176 rows) instead of relying on
-`find_latest_hiring_thread()` alone — Remotive's free API only ever exposes ~34 live postings so it
-can't carry volume, and Adzuna's growth was capped (`max_pages` 50→10) so it stops dominating every
-re-run.
+**Where we left off (2026-08-03):** Phase 1 (ingestion) is **done end-to-end**, the corpus
+composition problem is **fixed**, and all of that is **committed** (`6c83bc1`). **7,162 postings
+loaded** — HN 4,452 (62.2%), Adzuna 2,676 (37.4%), Remotive 34 (0.5%). That ratio was 89.6% Adzuna /
+9.2% HN / 1.1% Remotive two sessions ago; it inverted the project's premise (Phase 2 exists to prove
+LLM extraction from messy prose, and messy prose was a tenth of the data). Fixed by adding
+`find_hiring_threads(since, until)` to `hn_client.py` and backfilling all of 2023's HN threads (12
+months, 4,176 rows) — Remotive's free API only ever exposes ~34 live postings so it can't carry
+volume, and Adzuna's growth was capped (`max_pages` 50→10) so it stops dominating every re-run.
 
-Also added this session: a `posted_at TIMESTAMPTZ` column (`002_posted_at.sql`) — `thread_month` was
-overloaded as the only temporal signal for all three sources, which meant no day-level filtering was
-possible. Adzuna/Remotive backfilled from their own JSON (`raw_text`) via SQL; HN captures
-`posted_at` per-comment going forward (`HNComment.created_at`, new in `hn_client.py`) since HN's
-`raw_text` is bare prose with no timestamp to recover after the fact. **276 old HN rows (from before
-this column existed) still have `posted_at IS NULL`** — recoverable (Algolia's item API returns
-`created_at` directly per comment ID), not yet run.
+Also committed: a `posted_at TIMESTAMPTZ` column (`002_posted_at.sql`) — `thread_month` was
+overloaded as the only temporal signal for all three sources. Adzuna/Remotive backfilled from their
+own JSON via SQL; HN captures `posted_at` per-comment going forward (`HNComment.created_at`). **276
+old HN rows (from before this column existed) still have `posted_at IS NULL`** — recoverable
+(Algolia's item API returns `created_at` per comment ID; sketch exists), not yet run. And `load.py`/
+`adzuna_client.py` now use stdlib `logging` instead of `print`, with `upsert_posting` logging-and-
+continuing on a bad row instead of the whole batch dying blind.
 
-Logging was also added: `load.py` and `adzuna_client.py` use stdlib `logging` (not `print`), and
-`upsert_posting` now logs-and-continues on a bad row instead of the whole batch dying blind with no
-indication of which row caused it.
-
-**Uncommitted:** `load.py`, `hn_client.py`, `adzuna_client.py`, `db/schema/002_posted_at.sql`, plus
-this doc wrap-up — commit before starting Phase 2.
+**Gold-set tooling started, not yet run for real.** `evals/test.py` is an interactive CLI: loads a
+candidates JSON, shows each posting's `raw_text`, `y`/`n`/`q` to accept, saves incrementally to
+`evals/gold_30.json`, dedupes on `(source, external_id)` (not `external_id` alone — sources can
+collide there per the schema's own uniqueness constraint). `evals/candidates_hn.json` (40 random HN
+postings, exported with `source` field included) already exists. **`evals/` is untracked — nothing
+committed yet, including `test.py` itself.** Next session: run the review (`uv run python
+evals/test.py evals/candidates_hn.json`), pick ~15 messy ones, then export+review Adzuna (~10) and
+Remotive (~5) candidates the same way (SQL pattern for cross-source-safe exports is in chat history
+if not restated below). Decide then whether `candidates_*.json` should be gitignored (regenerable
+from SQL) while `test.py` gets committed for real.
 
 **Next up (in order):**
-1. Optional: backfill `posted_at` for the 276 old HN rows (script sketch exists, not run).
-2. Collect gold-set candidates — now stratified across sources (~15 HN / 5 Remotive / 10 Adzuna,
-   not HN-only as originally planned), since Adzuna's structured fields double as free eval labels
-   and its truncated `description` (hard cap ~1500 chars, ends in `…`) needs gold examples where the
-   correct extraction is a null field, not a hallucinated one.
-3. Phase 2: finalize the Pydantic extraction schema (open questions logged in ROADMAP.md) — this
-   blocks hand-labeling `evals/gold_30.json`, so candidate selection (step 2) can happen first but
-   labeling can't.
+1. Run the gold-set review session (`evals/test.py`) across all three sources — the actual labeling
+   still can't happen until the schema exists (next item), but candidate *selection* can finish now.
+2. Phase 2: finalize the Pydantic extraction schema (open questions logged in ROADMAP.md) — unblocks
+   hand-labeling `evals/gold_30.json`.
+3. Optional, low priority: backfill `posted_at` for the 276 old HN rows.
 
 **Watch out:**
 - Docker needs no babysitting — it is a systemd service, `enabled` at boot, and the user is in the

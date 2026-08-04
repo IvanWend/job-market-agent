@@ -120,7 +120,12 @@ pre-WSL `job-market-agent_pgdata` volume is gone; the current WSL Docker install
 - [x] Adzuna client — pulled forward from Phase 5 for exactly that reason: real pagination + retry,
       see the `load.py` flow section above for the full build/bug log.
 - [x] Target: ~700 raw postings loaded — **2,807 loaded** (276 HN + 34 Remotive + 2,497 Adzuna)
-- [ ] Collect gold-set candidates while ingesting (copy ~30 deliberately messy HN posts aside)
+- [~] Collect gold-set candidates — stratified across all three sources (~15 HN / 5 Remotive /
+      10 Adzuna, not HN-only as originally scoped: Adzuna's structured fields double as free eval
+      labels, and its truncated `description` needs gold examples where a null extraction is
+      correct). `evals/test.py` (interactive review CLI) built and verified; HN candidates exported
+      (`evals/candidates_hn.json`, 40 postings) but not yet reviewed. Adzuna/Remotive exports and
+      the actual review session are next.
 
 ## Phase 2 — Extraction + evals
 

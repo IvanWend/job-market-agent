@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from src.ingestion.adzuna_client import ADZUNA_ENDPOINT_URL
 from src.ingestion.adzuna_client import fetch_latest_jobs as fetch_adzuna_jobs
-from src.ingestion.hn_client import HNThread, find_hiring_threads, fetch_thread
+from src.ingestion.hn_client import HNThread, fetch_thread, find_hiring_threads
 from src.ingestion.remotive_client import (
     REMOTIVE_ENDPOINT_URL,
 )

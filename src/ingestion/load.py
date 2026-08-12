@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -9,6 +10,10 @@ from typing import NamedTuple
 import psycopg
 from dotenv import load_dotenv
 
+from src.ingestion.habr_client import HABR_DELAY_S, HABR_LIST_URL
+from src.ingestion.habr_client import fetch_description_html as fetch_habr_description
+from src.ingestion.habr_client import fetch_vacancy_cards as fetch_habr_cards
+from src.ingestion.habr_client import new_session as new_habr_session
 from src.ingestion.hn_client import HNThread, fetch_thread, find_latest_hiring_thread
 from src.ingestion.remotive_client import REMOTIVE_ENDPOINT_URL
 from src.ingestion.remotive_client import fetch_latest_jobs as fetch_remotive_jobs
@@ -30,6 +35,13 @@ ON CONFLICT (source, external_id) DO UPDATE
   WHERE raw_postings.raw_text IS DISTINCT FROM EXCLUDED.raw_text
 RETURNING (xmax = 0) AS inserted;
 """
+
+KNOWN_IDS_SQL = "SELECT external_id FROM raw_postings WHERE source = %s"
+
+# Habr's detail fetches are the one part of a run that takes minutes rather than
+# seconds, so it heartbeats instead of going silent. Per-posting logging would be
+# ~460 lines for a job that runs unattended.
+HABR_PROGRESS_EVERY = 50
 
 
 # A tuple so psycopg can pass it straight to UPSERT_SQL as parameters; named so
@@ -99,25 +111,106 @@ def web3_to_rows(jobs: list[dict]) -> list[Row]:
     return rows
 
 
-def fetch_hn_rows() -> list[Row]:
+def habr_to_rows(cards: list[dict]) -> list[Row]:
+    rows: list[Row] = []
+    for card in cards:
+        posted_at = to_posted_at(card["publishedDate"]["date"])
+        thread_month = to_thread_month(posted_at)
+        # ensure_ascii=False keeps the Cyrillic readable in the column instead of
+        # storing it as \uXXXX escapes at roughly six bytes per character.
+        raw_text = json.dumps(card, ensure_ascii=False)
+        rows.append(Row("habr", str(card["id"]), raw_text, thread_month, posted_at))
+    return rows
+
+
+def fetch_hn_rows(known_ids: set[str]) -> list[Row]:
     story_id, _ = find_latest_hiring_thread()
     return hnthread_to_rows(fetch_thread(story_id))
 
 
-def fetch_remotive_rows() -> list[Row]:
+def fetch_remotive_rows(known_ids: set[str]) -> list[Row]:
     return remotive_to_rows(fetch_remotive_jobs(REMOTIVE_ENDPOINT_URL))
 
 
-def fetch_web3_rows() -> list[Row]:
+def fetch_web3_rows(known_ids: set[str]) -> list[Row]:
     return web3_to_rows(fetch_web3_jobs(WEB3_ENDPOINT_URL, os.getenv("WEB3_API_KEY")))
+
+
+def fetch_habr_rows(known_ids: set[str]) -> list[Row]:
+    session = new_habr_session()
+    cards = fetch_habr_cards(HABR_LIST_URL, session=session)
+    cutoff = window_cutoff()
+
+    # Habr is the only source whose prose costs one HTTP request per posting, so
+    # every filter runs *before* the detail fetch rather than in within_window()
+    # afterwards — otherwise every run pays ~460 requests to rebuild rows it
+    # already has. The tradeoff: a posting already stored is never re-fetched, so
+    # an edited Habr posting keeps its original text and the guarded upsert's
+    # `updated` path stays dead for this source.
+    seen: set[str] = set()
+    fresh: list[dict] = []
+    duplicates = 0
+    for card in cards:
+        external_id = str(card["id"])
+        # The list endpoint pages by offset over a live, date-desc feed, so a
+        # posting published mid-run shifts everything down and a card on a page
+        # boundary comes back twice. Dropping it here saves the second detail
+        # fetch and keeps `unchanged` from counting a row that never existed.
+        # The flip side of the same shift — a card skipped entirely — is not
+        # fixable here, but it lands on the next run as a new id.
+        if external_id in seen:
+            duplicates += 1
+            continue
+        if external_id in known_ids:
+            continue
+        if to_posted_at(card["publishedDate"]["date"]) < cutoff:
+            continue
+        seen.add(external_id)
+        fresh.append(card)
+
+    logger.info(
+        "habr: %d cards, %d new and in-window, %d stored or aged out, %d paging duplicates.",
+        len(cards),
+        len(fresh),
+        len(cards) - len(fresh) - duplicates,
+        duplicates,
+    )
+
+    enriched: list[dict] = []
+    missing = 0
+    for index, card in enumerate(fresh):
+        # The client throttles its own list pages; spacing out the detail fetches
+        # is the caller's job, and this is the only caller that makes ~460 of them.
+        if index:
+            time.sleep(HABR_DELAY_S)
+        if index % HABR_PROGRESS_EVERY == 0:
+            logger.info("habr: fetching descriptions %d/%d…", index + 1, len(fresh))
+
+        description_html = fetch_habr_description(str(card["id"]), session=session)
+        if description_html is None:
+            missing += 1
+        enriched.append(card | {"description_html": description_html})
+
+    # A description comes back None for an archived posting, but also if the page
+    # markup moved out from under DESCRIPTION_SELECTOR — in which case every row
+    # still inserts cleanly, just with no prose to extract from. Loud on the way
+    # past, so a silently gutted source cannot look like a healthy run.
+    if missing:
+        log = logger.warning if missing > len(fresh) // 10 else logger.info
+        log("habr: %d/%d postings returned no description.", missing, len(fresh))
+
+    return habr_to_rows(enriched)
 
 
 # One entry per source. Each fetcher owns exactly one board, so a board that is
 # down, rate-limited or has changed shape costs its own rows and nothing else.
-SOURCES: dict[str, Callable[[], list[Row]]] = {
+# Every fetcher is handed the external_ids already stored for its source; only
+# habr uses them, because only habr pays per-posting for the text it would refetch.
+SOURCES: dict[str, Callable[[set[str]], list[Row]]] = {
     "hn": fetch_hn_rows,
     "remotive": fetch_remotive_rows,
     "web3": fetch_web3_rows,
+    "habr": fetch_habr_rows,
 }
 
 
@@ -153,8 +246,20 @@ def upsert_posting(conn, rows) -> LoadStats:
     return LoadStats(inserted, updated, unchanged, failed)
 
 
-def load_source(conn, name: str, fetch: Callable[[], list[Row]]) -> LoadStats:
-    rows = fetch()
+def known_external_ids(conn, source: str) -> set[str]:
+    # Wrapped in an explicit transaction block so the connection is back to idle
+    # before the caller starts its network I/O. psycopg opens a transaction on
+    # the first statement and leaves it open: a multi-minute fetch would sit
+    # idle-in-transaction, and worse, upsert_posting's conn.transaction() would
+    # then nest as a savepoint instead of being the real per-source transaction
+    # it is written to be.
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute(KNOWN_IDS_SQL, (source,))
+        return {row[0] for row in cur}
+
+
+def load_source(conn, name: str, fetch: Callable[[set[str]], list[Row]]) -> LoadStats:
+    rows = fetch(known_external_ids(conn, name))
     fresh = within_window(rows)
     logger.info(
         "%s: fetched %d postings, %d within %d days.", name, len(rows), len(fresh), WINDOW_DAYS

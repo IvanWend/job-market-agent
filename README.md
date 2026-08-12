@@ -1,14 +1,15 @@
-# Job Market Intelligence Agent
+# Remote Job Search Agent
 
-An agent that ingests tech job postings from heterogeneous sources, extracts structured data from
-messy prose with an LLM, stores it in **Postgres + pgvector** (relational *and* embeddings in one
-database), and answers analytical questions about the job market — *"what skills are trending for
+A **remote job search agent over heterogeneous boards.** It ingests tech job postings, extracts
+structured data from messy prose with an LLM, stores it in **Postgres + pgvector** (relational *and*
+embeddings in one database), and answers analytical questions — *"what skills are trending for
 backend roles"*, *"which postings match this résumé"*. Portfolio project; second after
 [cv-tailor-ru](../) (LLM résumé tailoring).
 
-**Status:** Phase 1 (ingestion) **done** — HN, Remotive, and Adzuna clients plus the idempotent
-loader are all working and verified. **7,162 postings loaded** (HN 4,452, Adzuna 2,676, Remotive
-34). Gold-set candidates selected; Phase 2 (extraction + evals) starts next. See
+**Status:** ingestion **done**. All four source clients — HN, Remotive, Web3.career, Habr Career —
+plus the idempotent loader and the retention purge are working and verified. The corpus is
+remote-only and kept to a **rolling 90-day window** — **1,098 postings** (HN 502, Habr 460, Web3 100,
+Remotive 36). Phase 2 (extraction + evals) starts next. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is built vs. planned, and
 [docs/PROMPT.md](docs/PROMPT.md) for the session-kickoff brief.
 
@@ -19,18 +20,24 @@ deployment.
 ## How it works
 
 ```
-INGESTION    HN "Who is Hiring" (Algolia) + Remotive + Adzuna APIs ──►  raw_postings (Postgres)
+INGESTION    HN (Algolia) + Remotive + Web3.career + Habr Career ──►  raw_postings (Postgres)
+RETENTION    rolling 90-day window — filtered at ingest, purged on age
 EXTRACTION   LLM + Pydantic schema, grounded by verbatim quotes ──►  structured_postings
 STORAGE      Postgres + pgvector; local bge-small-en-v1.5 embeddings ──►  posting_embeddings
 AGENT        DeepSeek tool-calling loop: sql_query · vector_search · resume_match
 SERVING      FastAPI (SSE streaming) · Langfuse tracing · Docker Compose
 ```
 
+Each source runs as an **independent pipeline** — fetch → window filter → idempotent upsert →
+commit. A board that is down or has changed shape costs its own rows and nothing else.
+
 The design contrast that makes the project a good demo: **HN postings are pure unstructured prose**
-(hardest extraction target), **Remotive/Adzuna are semi-structured JSON** — normalizing all three
-into one schema is the point, and Adzuna's own structured fields (salary, category) double as free
-eval ground truth. Every non-null extracted field carries a **verbatim source quote** so evals can
-check grounding and catch fabrication (lesson carried from cv-tailor-ru).
+(hardest extraction target), **Remotive and Web3.career are semi-structured JSON**, and **Habr is
+both** — a structured card plus a separately-fetched HTML body. Normalizing them into one schema is
+the point, and their own structured fields (salary, tags) double as free eval ground truth when held
+out of the model's input. Every non-null extracted field carries a
+**verbatim source quote** so evals can check grounding and catch fabrication (lesson carried from
+cv-tailor-ru).
 
 ## Tech stack
 
@@ -40,6 +47,7 @@ check grounding and catch fabrication (lesson carried from cv-tailor-ru).
 | Agent + extraction LLM | DeepSeek (OpenAI-compatible API); Groq fallback |
 | Structured outputs | Pydantic v2 — the schema is the contract for extraction *and* evals |
 | Embeddings | **Undecided** — `BAAI/bge-small-en-v1.5` via sentence-transformers (384-dim) as designed, vs. `bge-m3` via the already-installed local Ollama (1024-dim). Fixes `vector(n)`, so decide before Phase 3 ([ROADMAP](docs/ROADMAP.md#phase-3--storage--retrieval)) |
+| HTML parsing | BeautifulSoup 4 (stdlib `html.parser` backend) — Habr description bodies |
 | Database | Postgres 17 + pgvector (single DB: relational + vector) |
 | API | FastAPI, SSE streaming |
 | Tracing | Langfuse (self-hosted, Docker) — every LLM call traced from day one |
@@ -48,16 +56,27 @@ check grounding and catch fabrication (lesson carried from cv-tailor-ru).
 
 ## Data sources
 
+Remote-only, and **corpus size is deliberately not a goal** — freshness is. Postings older than 90
+days are mostly filled and only add noise to retrieval.
+
 - **HN "Who is Hiring" (primary)** — monthly threads via the free Algolia HN API
-  (`hn.algolia.com/api/v1`); top-level comments are job postings, pure prose. No auth. Backfilled
-  across multiple months, not just the latest thread.
-- **Adzuna (volume)** — free key, rate-limited, paginated; carries most of the row count. Its
-  `description` field is truncated to a snippet (~1.5KB cap) by the free tier — extraction on these
-  rows legitimately nulls out fields whose evidence was in the cut-off text.
-- **Remotive (secondary)** — `remotive.com/api/remote-jobs`, free, no auth; semi-structured JSON.
-  The free API only ever exposes ~34 currently-live postings, no history — can't carry volume alone.
-- **Ruled out:** hh.ru (API closed Dec 2025; ToS forbids derivative DBs — do not scrape),
-  LinkedIn (ToS / auth walls).
+  (`hn.algolia.com/api/v1`); top-level comments are job postings, pure prose. No auth. One thread
+  per run; a 90-day window holds about three, and the idempotent upsert makes repeat runs free.
+- **Web3.career** — token-gated (free, email-gated). Hard cap of 100 jobs per call; `page` and
+  `offset` are ignored, so breadth comes from repeating per `tag`. Full HTML `description`. Its
+  `estimated_*` salary fields are the site's own guess, not employer-stated — not ground truth.
+- **Remotive** — `remotive.com/api/remote-jobs`, free, no auth; semi-structured JSON. Only ever
+  exposes ~17–34 currently-live postings, no history.
+- **Habr Career** — undocumented frontend API, no key needed, real pagination (`per_page=50` is the
+  server's true cap; a larger value is echoed back in `meta.perPage` but still yields 50 rows, so
+  page off `meta.totalPages`). The list endpoint returns cards with **no description text**, so the
+  prose comes from an HTML parse of `/vacancies/{id}` — one request per posting, which is why the
+  loader skips ids it already stores. Postings are Russian. ~460 live remote postings spanning about
+  30 days; 31% carry an employer-stated salary, and `predictedSalary` is Habr's own guess.
+- **Cut:** Adzuna (imputed salaries, truncated descriptions, not remote-focused) — its rows stay in
+  the frozen eval snapshot. **Parked:** CryptoJobsList (RSS returns zero items, API is
+  Cloudflare-guarded). **Ruled out:** hh.ru (API closed Dec 2025; ToS forbids derivative DBs — do
+  not scrape), LinkedIn (ToS / auth walls).
 
 ## Data model
 
@@ -84,25 +103,39 @@ class Posting(BaseModel):
 ```sql
 raw_postings (
   id BIGINT IDENTITY PK, source TEXT, external_id TEXT, raw_text TEXT,
-  thread_month DATE, posted_at TIMESTAMPTZ, ingested_at TIMESTAMPTZ DEFAULT now(),
+  thread_month DATE, posted_at TIMESTAMPTZ NOT NULL, ingested_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ,
-  CHECK (source IN ('hn','remotive','adzuna')), UNIQUE (source, external_id)
+  CHECK (source IN ('hn','remotive','web3','habr')), UNIQUE (source, external_id)
 )
+db_meta ( singleton BOOL PK, role TEXT CHECK (role IN ('live','eval')) )  -- purge guard
 structured_postings ( id, raw_posting_id FK, extracted JSONB, model, prompt_version, extracted_at )
 posting_embeddings  ( posting_id FK, embedding vector(384|1024), embedded_text )  -- dim TBD
 ```
 
+`posted_at` is `NOT NULL` because the purge filters on it and `WHERE posted_at < …` silently skips
+NULLs — those rows would live forever. `db_meta` holds one row saying whether this database is the
+live rolling corpus or a restored eval snapshot; the purge refuses to run unless it reads `'live'`,
+which is what protects the eval baseline from a mistyped connection string.
+
 Ingestion is **idempotent, verified end-to-end**: the loader upserts on `(source, external_id)` with
 a guarded `ON CONFLICT … DO UPDATE … SET updated_at = now() WHERE raw_text IS DISTINCT FROM …`, so
 re-fetching an unchanged posting is a true no-op and `updated_at` only moves when the text actually
-changes. Verified against 276 real HN postings: the first load inserts all 276, a repeat run reports
-all 276 `unchanged` with `updated_at` untouched, and hand-editing one row's text before a third run
-produces exactly one `updated` row with a fresh `updated_at`.
+changes. A repeat run reports `inserted: 0, updated: 0` for every source whose board hasn't moved.
+
+Each source commits as one transaction, with a **per-row savepoint** so a single malformed posting
+is counted as `failed` and skipped instead of aborting the rest — in psycopg a failed statement
+poisons the whole transaction, and every row after it would otherwise fail too.
+
+Each fetcher is handed the `external_id`s already stored for its source. Only Habr uses them: its
+prose costs one HTTP request *per posting*, so a cold run is ~15 minutes and a warm one 35 seconds.
+The tradeoff — a stored Habr posting is never re-read, so an edited one keeps its original text.
+That id read is wrapped in `conn.transaction()`; a bare `SELECT` would leave the connection
+idle-in-transaction and demote `upsert_posting`'s transaction to a savepoint.
 
 ## Setup
 
-> Phase 1 is done — everything below is working today: `raw_postings` DDL, all three ingestion
-> clients (HN, Remotive, Adzuna), and the loader (idempotent upsert, verified end-to-end).
+> Everything below is working today: `raw_postings` DDL, the three ingestion clients (HN, Remotive,
+> Web3.career), the loader (idempotent upsert, verified end-to-end), and the retention purge.
 
 Developed on **WSL2 Ubuntu** with Docker Engine running natively in WSL (systemd) — *not* Docker
 Desktop. Requirements: Python 3.12+ (3.13 pinned via `.python-version`),
@@ -122,16 +155,36 @@ printf 'CREATE EXTENSION IF NOT EXISTS vector;\n' > init/001_extensions.sql
 docker compose up -d
 docker compose ps                       # wait for "healthy"
 
-# 3. Apply the schema (each file is re-runnable, so safe to repeat)
+# 3. Apply the schema in order (each file is re-runnable, so safe to repeat)
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/001_raw_postings.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/002_posted_at.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/003_retention.sql
+#   004 narrows the source CHECK and only applies once no adzuna rows remain — Postgres validates
+#   a new CHECK against existing rows, so run the purge first on a pre-pivot database.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/004_source_check.sql
 
 # 4. .env (git-ignored) — see .env.example
 #   POSTGRES_PASSWORD=...
 #   DATABASE_URL=postgresql://jobmarket:...@localhost:5432/jobmarket
+#   WEB3_API_KEY=...        # free, email-gated at web3.career
 #   DEEPSEEK_API_KEY=sk-...
 #   (POSTGRES_PASSWORD and the password embedded in DATABASE_URL must match, or step 3+ fails
 #   with "password authentication failed")
+
+# 5. Ingest, then enforce the window.
+#   The first run takes ~15 min: Habr needs one HTML request per posting and the
+#   client throttles them. Later runs fetch only newly-published ids — seconds.
+uv run python -m src.ingestion.load
+uv run python -m src.ingestion.purge            # dry run — prints what would go
+uv run python -m src.ingestion.purge --apply    # actually deletes
+```
+
+**Take a snapshot before the first purge on a corpus you care about** — the deleted rows are not
+re-fetchable from the boards. No snapshot exists yet; the next one is taken from all four sources:
+
+```bash
+docker exec job-market-agent-db-1 pg_dump -U jobmarket -d jobmarket \
+  -Fc -Z9 -t raw_postings > evals/snapshots/$(date +%F)_raw.dump
 ```
 
 **WSL2 + mirrored networking gotcha:** if step 2 fails with `failed to bind host port ... address
@@ -160,16 +213,20 @@ pyproject.toml         # deps (uv) + ruff/mypy config; uv.lock is committed
 .env.example           # committed key names, no values; .env is git-ignored
 .gitattributes         # force LF (files cross into the Linux Postgres container)
 docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume, ./init mount
-db/schema/             # numbered, re-runnable DDL (001_raw_postings.sql, 002_posted_at.sql)
+db/schema/             # numbered, re-runnable DDL (001 raw_postings … 004 source CHECK)
 init/                  # first-boot bootstrap only — vector + pg_trgm
 src/
   ingestion/
-    hn_client.py       # Algolia HN client: find thread(s) → fetch top-level comments (HNThread)
+    hn_client.py       # Algolia HN client: find thread → fetch top-level comments (HNThread)
     remotive_client.py # Remotive API client
-    adzuna_client.py   # Adzuna API client — pagination + retry/backoff
-    load.py            # fetch all three, convert to rows, idempotent upsert into Postgres
+    web3_client.py     # Web3.career API client — token-gated, redirect-guarded
+    habr_client.py     # Habr Career: paginated cards + per-posting HTML description parse
+    retention.py       # WINDOW_DAYS + cut sources, shared by the loader and the purge
+    load.py            # per-source pipelines → window filter → idempotent upsert
+    purge.py           # deletes cut sources + aged-out rows; dry-run by default, db_meta-guarded
 evals/
   generate_gold_dataset.py  # pulls gold-set candidate rows from raw_postings
+  snapshots/                # frozen dumps — eval inputs, committed
 docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log
   PROMPT.md            # paste-to-start session kickoff brief

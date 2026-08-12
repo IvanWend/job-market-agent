@@ -11,188 +11,155 @@ earlier ones.
 - I write the code; the assistant guides, reviews, and verifies (read + run before assessing).
 - Paste errors, not fixes. No silent edits to project files.
 
-## Build status (updated 2026-08-11)
+## Build status (updated 2026-08-12)
 
-Phase 1 is **done and committed**. All three ingestion clients (`hn_client.py`, `remotive_client.py`,
-`adzuna_client.py`) plus `load.py` (fetch all three → rows → idempotent upsert on
-`(source, external_id)`) are working and verified against real data. Toolchain is uv + ruff + mypy,
-all clean.
+**Phases 1 and 1b are implemented and verified — all four sources are live.** The corpus is
+remote-only and rolling:
 
-**The working tree is currently broken and uncommitted** — `hn_client.py` has had
-`find_hiring_threads()` deleted while `load.py:12` still imports it, so `import src.ingestion.load`
-raises `ImportError`. `ruff check src/` reports 8 errors. `web3_client.py` is new and untracked.
-`pyproject.toml` gained `jupyterlab` + `pydantic-ai`. Fix the import before anything else runs.
+| source | rows | oldest | newest |
+|---|---|---|---|
+| habr | 460 | 2026-07-13 | 2026-08-12 |
+| hn | 502 | 2026-07-01 | 2026-08-12 |
+| remotive | 36 | 2026-07-02 | 2026-08-08 |
+| web3 | 100 | 2026-06-05 | 2026-08-10 |
 
-Phase 1b (below) **repoints the project at remote-only sources with a 90-day freshness window**.
-Decided 2026-08-11, not yet implemented.
+**1,098 rows**, 0 outside the 90-day window, 0 Adzuna. Toolchain (uv + ruff + mypy) clean.
 
-Phase 2 is **designed, not yet implemented**. Schema decisions are locked (see below), the first
-`pydantic-ai` spike ran end-to-end against a real HN posting in `experiments/`, and the five defects
-it exposed are logged as the first implementation tasks.
+**Ingestion flow —** `load.py` holds a `SOURCES` dict of four independent pipelines. For each:
+read the `external_id`s already stored → fetch → filter to the 90-day window → idempotent upsert on
+`(source, external_id)` → commit. A source that fails is logged and skipped; the rest still load.
+Per-row savepoints keep one bad row from aborting its source's transaction.
+
+**Still to implement:** `jobmarket_eval` restore + read-only role · offline fixtures · all of
+Phase 2 onward.
 
 **Durable gotchas worth remembering in later phases:**
-- **`raw_text` for Adzuna and Remotive is the entire API JSON**, not prose — `load.py` stores
+- **`raw_text` for Remotive, Web3 and Habr is the entire API JSON**, not prose — `load.py` stores
   `json.dumps(job)`. This is *correct* (same replay-buffer rule as HN's verbatim HTML), but it means
-  the structured fields — Adzuna's `salary_min/max`, `title`, `company`, `contract_time`; Remotive's
-  `tags`, `job_type`, `category` — sit **inside the model's input**. Feeding `raw_text` straight to
-  the LLM makes extraction a copy job and makes quote-grounding trivially satisfiable by quoting
-  JSON. Phase 2 must split input text from held-out ground truth (see source adapters below).
-- **Adzuna salaries are mostly imputed.** 9 of 10 gold rows carry `"salary_is_predicted": "1"` —
-  Adzuna's own ML guess, not employer-stated. Tell: `salary_min == salary_max` exactly. Only rows
-  with `"0"` are usable as salary ground truth.
-- Adzuna's `description` is **truncated** (~1.5KB, ends in `…`), so its held-out ground truth
-  often has no supporting evidence in the input text. Those are legitimate nulls, not extraction
-  misses — the eval must score them that way.
+  structured fields sit **inside the model's input**. Feeding `raw_text` straight to the LLM makes
+  extraction a copy job and makes quote-grounding trivially satisfiable by quoting JSON. Phase 2
+  must split input text from held-out ground truth (see source adapters below).
+- **Habr's `raw_text` is the card dict plus a `description_html` key** the loader merges in from the
+  detail page, serialized with `ensure_ascii=False` so the Cyrillic stays readable in the column.
+  The adapter's job for this source is exactly that split: `description_html` is the model's input,
+  everything else on the card (`salary`, `skills`, `qualification`, `employment`) is held-out ground
+  truth. 142/459 carry an employer-stated salary; `predictedSalary` is imputed and is **not**.
+- **Only Habr uses the `known_ids` argument** every fetcher now receives. Its prose costs one HTTP
+  request per posting, so refetching what is already stored would mean ~460 requests and ~15 minutes
+  every run. The cost: a stored Habr posting is never re-read, so an edited one keeps its original
+  text and the `updated` path is dead for that source. Verified — a warm re-run took 35s.
+- **Reading `known_ids` must be wrapped in `conn.transaction()`.** A bare `SELECT` leaves the
+  connection `INTRANS`, which holds it idle-in-transaction across minutes of network I/O *and*
+  demotes `upsert_posting`'s `conn.transaction()` to a savepoint. Confirmed against
+  `pgconn.transaction_status`: wrapped returns to `IDLE`, bare does not.
+- **Habr's list pagination is racy.** Offset paging over a live, date-desc feed means a posting
+  published mid-run shifts everything down a page, so a card on a page boundary arrives twice — the
+  first run returned 459 cards for 458 distinct ids. `fetch_habr_rows` dedupes by id before the
+  detail fetch. The mirror case (a card skipped entirely) is not fixable at read time but self-heals
+  on the next run, when it shows up as an unknown id.
+- **Imputed salaries are not ground truth.** Web3's `estimated_min_salary`/`estimated_max_salary`
+  and Habr's `predictedSalary` are the sites' own guesses; only `salary_min_value`/
+  `salary_max_value` and `salary.from`/`salary.to` are employer-stated.
+- **Held-out ground truth with no evidence in the input is a legitimate null**, not an extraction
+  miss — the eval must score it that way whenever a source's structured field outruns its prose.
 - `psycopg.connect()` with no argument silently falls back to a local Unix socket instead of reading
   `DATABASE_URL` — always pass the connection string explicitly. **Same trap in the shell:**
   `docker exec ... pg_dump "$DATABASE_URL"` expands `$DATABASE_URL` on the *host*, so if `.env`
   wasn't sourced it passes an empty string and `pg_dump` falls back to the socket as OS user `root`
   (`FATAL: role "root" does not exist`). Either `set -a; . ./.env; set +a` first, or pass explicit
-  flags: `docker exec job-market-agent-db-1 pg_dump -U jobmarket -d jobmarket ...` (local socket
-  connections in that container are not password-gated).
-- `.env` has `WEB3_API_KEY =` with a space before `=`. Bash reads that line as a command, so
-  sourcing `.env` prints `WEB3_API_KEY: command not found`, and python-dotenv doesn't give the key
-  name you expect either. Fix the line.
-- Adzuna's bare endpoint only returns page 1 by default even with thousands of matches; needs
-  `results_per_page` + a page loop. Its retry/backoff covers `ConnectionError`/`Timeout` but not
-  `HTTPError` (429/5xx) — a rate limit still kills the run. Not yet fixed.
+  flags: `docker exec job-market-agent-db-1 pg_dump -U jobmarket -d jobmarket ...`.
+- **`conn.transaction()` on an idle psycopg connection issues a real `BEGIN`/`COMMIT`, not a
+  savepoint.** It only nests as a savepoint when a transaction is already open. `upsert_posting`
+  therefore opens an explicit outer block; without it every row committed individually.
 - Docker container name is directory-derived (`job-market-agent-db-1`), not the `pyproject.toml`
   package name (`jobmarket`) — don't hardcode the wrong one when scripting against it.
 
 ## Phase 1 — Ingestion (no LLM calls) ← DONE
 
 - [x] Docker Compose: Postgres 17 + pgvector (healthcheck, named volume, `init/` entrypoint)
-- [x] Algolia HN client
-  - [x] `find_latest_hiring_thread()` → newest thread `story_id` + title
-  - [x] `find_hiring_threads(since, until)` → all matching threads in a date range, for backfill
-        beyond just the latest month. Verified against the live API across multiple ranges,
-        including a multi-page pagination boundary.
-  - [x] `fetch_thread(story_id)` → `HNThread` with all **top-level** comments. One `/items/` call,
-        so no pagination. Comment `id` → `str` (it is the `external_id` dedup key; the API returns
-        an int). Text kept as **verbatim HTML** — the table is a replay buffer, and stripping is a
-        lossy parse that Phase 2 should do instead. Drops unusable comments via
-        `(child.get("text") or "").strip()`, which covers all three shapes: absent key, present-but-
-        null (deleted), and whitespace-only. `.get("text", "")` does **not** — a default only fires
-        on a missing key, never on a present `null`.
-- [x] `raw_postings` schema + loader with dedup
-  - [x] DDL `db/schema/001_raw_postings.sql` + `002_posted_at.sql` — guarded upsert on
-        `(source, external_id)`, five constraints (bad source, mid-month `thread_month`, HN without
-        a month, blank text, manual `id`), all verified.
-  - [x] loader: idempotent upsert — verified (insert → no-op re-run → single-row repair on
-        hand-edited text).
-- [x] Remotive client — semi-structured JSON, contrasts with HN's pure prose. Free API only ever
-      exposes ~34 currently-live postings (no historical/paginated data), couldn't carry the volume
-      target alone.
-- [x] Adzuna client — pulled forward from Phase 5 for exactly that reason: real pagination + retry
-      (429/5xx not yet covered — see gotchas above).
-- [x] Target: ~700 raw postings loaded — **7,162 loaded** (HN 4,452 / Adzuna 2,676 / Remotive 34).
-      Started at 2,807 (89.6% Adzuna / 9.2% HN / 1.1% Remotive), which inverted the project's premise
-      (messy prose was a tenth of the corpus). Fixed by backfilling 12 months of HN threads instead
-      of just the latest one.
-- [x] Collect gold-set candidates — stratified across all three sources, 10 each (HN/Adzuna/
-      Remotive). Selected via random sampling per source (`evals/generate_gold_dataset.py`), not
-      hand-curated for messiness/edge cases — a known quality tradeoff to keep in mind once Phase 2
-      eval accuracy is measured. Sits in `evals/gold_30_candidates.json` (gitignored), ready for
-      hand-labeling once the schema exists. **No longer regenerable after the 90-day purge** — it was
-      sampled from rows that the purge deletes, which is why the frozen snapshot has to be taken
-      first (Phase 1b). Ten of these rows are Adzuna, now a cut source; they stay valid as *eval
-      inputs* out of the frozen DB even though nothing new arrives from there.
+- [x] Algolia HN client — `find_latest_hiring_thread()` + `fetch_thread(story_id)` → `HNThread` with
+      all top-level comments (one `/items/` call, no pagination). Comment `id` → `str` (it is the
+      `external_id` dedup key; the API returns an int). Text kept as **verbatim HTML** — the table is
+      a replay buffer, and stripping is a lossy parse that Phase 2 should do instead. Drops unusable
+      comments via `(child.get("text") or "").strip()`, which covers absent, null (deleted) and
+      whitespace-only; `.get("text", "")` does **not** — a default only fires on a missing key.
+      `find_hiring_threads(since, until)` was removed with the 90-day pivot: every row it backfilled
+      is now outside the window.
+- [x] `raw_postings` schema + loader with dedup — DDL `001`–`004`, guarded upsert on
+      `(source, external_id)`, verified idempotent (insert → no-op re-run → single-row repair on
+      hand-edited text).
+- [x] Remotive client — semi-structured JSON. Free API only ever exposes ~34 currently-live postings.
+- [x] Adzuna client — **deleted 2026-08-12** with the pivot.
+- [x] Collect gold-set candidates — 10 each from HN/Adzuna/Remotive via
+      `evals/generate_gold_dataset.py`, random per source rather than hand-curated for messiness.
+      **Superseded:** the set is resampled from the four-source snapshot. The old rows survive with
+      full `raw_text` in `evals/gold_30_candidates.json` (gitignored) if any are worth keeping.
 
-## Phase 1b — Remote-source pivot + 90-day window (decided 2026-08-11)
+## Phase 1b — Remote-source pivot + 90-day window ← DONE (except Habr)
 
-**Why:** the project is being repointed at sources I'd actually use to find remote work. Corpus
-*size* is explicitly no longer a goal; freshness is. Postings older than 90 days are mostly filled
-and only add noise to retrieval.
+Sources the project actually targets, all probed live:
 
-### Source lineup — all four probed live on 2026-08-11
-
-| Source | Verdict | Detail |
+| Source | Status | Notes |
 |---|---|---|
-| **HN** | keep, rolling | The only pure-prose source. A 90-day window still holds ~3 monthly threads, so prose keeps flowing — only the 2023 backfill dies. |
-| **Remotive** | keep | Works. Still only ~34 live postings; no volume on its own. |
-| **Habr Career** | add | Undocumented frontend API: `GET career.habr.com/api/frontend/vacancies?type=all&remote=true&q=…` → 200 JSON, `{list, meta:{totalResults, perPage:25, currentPage, totalPages}}`. Real pagination. |
-| **Web3.career** | add, blocked on key | Free but email-gated. Without a token the endpoint **302s to the sales page** — which is what `web3_client.py`'s catch-all `except` currently swallows. Key applied for 2026-08-10, expected 2026-08-11. |
-| **CryptoJobsList** | parked | No usable public feed. `/api/jobs` returns the Next.js HTML shell; unauthenticated hits get a Cloudflare interstitial (403). The only real feed, `cryptojobslist.com/rss` → 308 → `api.cryptojobslist.com/jobs.rss`, returns **valid RSS with zero `<item>` elements**. `api.cryptojobslist.com/jobs{,.json}` → 404. Revisit if their feed ever has items; ingesting it today means scraping against Cloudflare. |
-| **Adzuna** | cut | Imputed salaries, truncated descriptions, not remote-focused. |
+| **HN** | live | The only pure-prose source. One thread per run; 90 days holds ~3 threads and the upsert makes repeat runs free. |
+| **Remotive** | live | Semi-structured JSON, ~17–34 live postings, no history. |
+| **Web3.career** | live | Token-gated. Payload is a 3-element array `[docs, tos, jobs]` served as `text/html`. Hard cap 100 jobs/call — `page` and `offset` are **ignored**, so more volume comes from repeating per `tag`, not paging. Without a valid token it **302s to the sales page** instead of erroring, hence `allow_redirects=False`. Dates are RFC 2822; use `date_epoch`. ToS requires linking back via `apply_url` and crediting web3.career. |
+| **Habr Career** | live | Needs no key. `GET career.habr.com/api/frontend/vacancies?type=all&remote=true&per_page=50&page=N` → `{list, meta:{totalResults, perPage, currentPage, totalPages}}`. **`per_page=50` is the real cap** — a larger value is echoed back in `meta.perPage` but still returns 50 rows, so page off `totalPages`, never `perPage`. **List endpoint has no description text** — cards only; the prose comes from an HTML parse of `/vacancies/{id}`, selector `div.vacancy-description__text` (the JSON detail endpoint serves the SPA shell). Archived postings 404 → `None`, not an error. ~460 live remote postings spanning ~30 days, so nothing to backfill. Postings are Russian — affects the `stack` alias map, seniority enums, and gold labeling. |
+| **CryptoJobsList** | parked | No usable public feed: `/rss` returns valid RSS with zero `<item>`s, the API is Cloudflare-guarded. |
 
-**Habr caveat:** the list endpoint returns card data only — `title`, `skills[]`,
-`salary{from,to,currency}`, `employment`, `remoteWork`, `publishedDate.date` (ISO, `+03:00`) — and
-**no description text**. `api/frontend/vacancies/{id}` serves the SPA HTML shell, so the actual
-posting prose requires an HTML parse of `/vacancies/{id}`. Store that body, not just the card:
-the card is pre-parsed, and pre-parsed input is what makes extraction a copy job. Postings are
-Russian — that lands on the `stack` alias map, the seniority enums, and gold labeling.
+**Keeping extraction non-trivial is the standing risk of this pivot.** Three of four sources hand
+over clean JSON. The defense is now in place on two of three counts: HN keeps rolling, and Habr's
+HTML body **is** stored (`description_html`, avg 2,786 chars of real prose). The third — holding
+structured fields out as ground truth — is Phase 2's source adapters.
 
-**Keeping extraction non-trivial is the whole risk of this pivot.** Three of four sources hand over
-clean JSON; if that's all the model ever sees, "why is there an LLM here?" has no good answer. The
-defense: keep HN rolling, store Habr's HTML body, and hold structured fields out as ground truth in
-the source adapters (already the Phase 2 design — it just matters more now).
+### Retention — implemented
 
-### Retention rules
-
-- **≤ 90 days, enforced in two places.** Purge on age *and* filter at ingest. Age-purge alone means
-  every `load.py` run re-inserts the same expired postings the boards still serve, which the next
-  purge deletes again — insert/delete churn forever, and `LoadStats` stops meaning anything.
-- **Purge on `posted_at` needs a NULL guard.** `WHERE posted_at < now() - interval '90 days'`
-  silently skips NULLs and those rows live forever. Currently 0 NULLs, so make the column
-  `NOT NULL` now. (The old PROMPT.md note about 276 NULL HN rows is **stale** — verified all
-  populated on 2026-08-11. The 276 is a coincidence: it's the HN row count inside the 90-day window.)
-- **`db_meta(role)` guard.** One row, `'live'` or `'eval'`; the purge asserts `role = 'live'` before
-  deleting. Two lines, and it removes the one mistake in this design that costs the eval baseline.
-- **Time-series analytics lose their substrate.** A rolling 90-day window can't answer "how did Rust
-  demand change over the year" — Phase 3 salary distributions and Phase 5 trend charts. Fix: write
-  monthly rollups (skill frequency, salary percentiles by seniority) to an aggregate table the purge
-  doesn't touch. Aggregates aren't postings, so they can be kept forever.
+- **90 days, enforced in two places:** `purge.py` deletes what aged out, `load.py` drops aged-out
+  rows before insert. Age-purge alone means every run re-inserts the same expired postings the
+  boards still serve, which the next purge deletes again. `WINDOW_DAYS` lives in `retention.py` so
+  the two cannot disagree.
+- **`db_meta` guard.** One row, `'live'` or `'eval'`. `purge.py` refuses unless `role = 'live'`, and
+  refuses outright if the table or row is missing. Verified: flipping the row to `'eval'` makes
+  `--apply` abort before deleting anything.
+- `purge.py` is **dry-run by default**; `--apply` deletes.
+- `posted_at` is `NOT NULL` — `WHERE posted_at < now() - interval '90 days'` silently skips NULLs
+  and those rows would live forever.
+- **Time-series analytics lose their substrate.** A rolling window can't answer "how did Rust demand
+  change over the year". Fix when Phase 3/5 need it: monthly rollups (skill frequency, salary
+  percentiles) to an aggregate table the purge doesn't touch. Aggregates aren't postings.
 
 ### Frozen eval DB
 
-Decided: keep a **frozen snapshot DB, used for evals only**; the live DB is the 90-day rolling one.
+The live DB rolls; evals run against a frozen snapshot — `evals/snapshots/YYYY-MM-DD_raw.dump`,
+a versioned dump file rather than a second live database, which would drift the first time something
+pointed `load.py` at it.
 
-- **"Frozen" means a versioned dump file, not a database nobody touches.** A second live DB drifts
-  the first time something points `load.py` at it. Artifact of record is
-  `evals/snapshots/YYYY-MM-DD_raw.dump`, committed; the running eval DB is a disposable restore.
-- Full 7,162-row dump measured at **2.9 MB** compressed (12 MB table, 1,410-byte average
-  `raw_text`) — commit it directly, git-lfs is not installed and not needed.
-- Restore into a separate database `jobmarket_eval` in the same container. `EVAL_DATABASE_URL` in
-  `.env` + `.env.example`. No second service, no second port.
-- **Read-only role** (`SELECT` only) on the eval DB. That, not discipline about which URL is which,
-  is what actually enforces frozen.
-- **Inputs in the dump, labels in git.** Hand-written labels get revised as the schema firms up and
-  those revisions must show up as reviewable diffs — invisible inside a binary dump. Key labels on
-  `(source, external_id)`, not `raw_postings.id`, so they survive a re-snapshot. Name the labeled
-  file `evals/gold_30_labeled.json`; `.gitignore` already excludes
-  `evals/gold_30_candidates.json`, and the labeled file must not get caught by that or a future glob.
-- **Re-snapshot deliberately, never in place:** new date-stamped filename, re-run labeling against
-  it. Each re-snapshot is another ~3 MB blob — fine at the two or three times it'll actually happen,
-  which is the natural brake on doing it casually.
-- **Don't put embeddings in the dump** once Phase 3 lands: 7k × 1024 dims × 4 bytes ≈ 29 MB of float
-  noise that won't compress. Snapshot `raw_postings` + `structured_postings`, regenerate embeddings
-  on restore — that makes the eval DB a test of the embedding pipeline instead of a fossil of it.
-- **Agent evals must run against the frozen snapshot.** Phase 4's ~15 canned questions asserted
-  against SQL ground truth would otherwise fail every week for reasons unrelated to the agent, since
-  the live corpus purges and refills underneath them.
+- **No snapshot exists.** The pre-pivot dump was deleted — it predated web3 and habr, so it could
+  only ever label two of the four live sources. The replacement is taken from the current corpus
+  (all four sources, 1,098 rows) and the gold set is resampled per source from it.
+- Restore into a separate database `jobmarket_eval` in the same container, then
+  `UPDATE db_meta SET role = 'eval'`. `EVAL_DATABASE_URL` in `.env` + `.env.example`. No second
+  service, no second port. **Not done yet**, along with its `SELECT`-only role — that role, not
+  discipline about which URL is which, is what actually enforces frozen.
+- **Inputs in the dump, labels in git.** Labels get revised as the schema firms up and those
+  revisions must be reviewable diffs, which they aren't inside a binary dump. Key labels on
+  `(source, external_id)`, not `raw_postings.id`, so they survive a re-snapshot. `.gitignore`
+  excludes `evals/gold_30_candidates.json` — `gold_labeled.json` must not get caught by that.
+- **Re-snapshot deliberately, never in place:** new date-stamped filename, re-run labeling.
+- **Don't put embeddings in the dump** once Phase 3 lands — float noise that won't compress.
+  Snapshot the tables, regenerate embeddings on restore: that makes the eval DB a test of the
+  embedding pipeline instead of a fossil of it.
+- **Agent evals must run against the snapshot.** Phase 4's canned questions asserted against SQL
+  ground truth would otherwise fail every week for reasons unrelated to the agent.
 
-### Tasks (in order — 1 has a deadline, the rest don't)
+### Remaining tasks
 
-- [ ] **Snapshot before the first purge.** 4,176 HN rows are unrecoverable once deleted. Row counts
-      at decision time: hn 4,452 total / **276** within 90d; adzuna 2,676 / 2,374; remotive 34 / 34.
-- [ ] Fix `find_hiring_threads` import so `load.py` runs again; clear the 8 ruff errors.
-- [ ] `003_*.sql` — widen the `source` CHECK (`hn`, `remotive`, `web3`, `habr`), `posted_at NOT NULL`,
-      add `db_meta`.
-- [ ] Restore `jobmarket_eval`, create the read-only role.
-- [ ] Purge + ingest-side age filter, behind the `db_meta` guard.
-- [ ] Habr client — needs no key, so it's unblocked regardless of what arrives tomorrow.
-- [ ] Web3.career client — rewrite once a real response can be inspected (see defects below).
-- [ ] Cache a fixture response per source. Two of four sources are undocumented or Cloudflare-guarded;
-      the demo path must run offline or it will break on presentation day.
-
-**`web3_client.py` defects (written before a token existed — field names are guesses):**
-1. No `timeout=`; the other clients use 10s. A hung socket hangs the whole load.
-2. Catch-all `except` → `return []`, so a dead API logs "Fetched 0 postings" and exits 0. Remotive
-   and Adzuna raise; this should too.
-3. Flattens jobs into `{title, company, url, …}`, but `load.py` stores `json.dumps(job)` verbatim.
-   Pre-flattening breaks the replay-buffer rule — return raw dicts, flatten in the Phase 2 adapter.
-4. `company_name` / `apply_url` / `salary_range` are unverified guesses. Dump one real response first.
-5. `limit: 5` hardcoded, no pagination.
+- [x] Habr client — `habr_client.py` (paginated cards + per-posting HTML description), wired into
+      `SOURCES`. 460 rows loaded, 0 missing descriptions, avg 2,786 chars.
+- [ ] Snapshot the current four-source corpus, then resample the gold set per source from it.
+- [ ] Restore `jobmarket_eval` from that snapshot, create the read-only role, set `role = 'eval'`.
+- [ ] Cache a fixture response per source. Two of four sources are undocumented or Cloudflare-
+      guarded; the demo path must run offline or it will break on presentation day.
 
 **Framing:** with web3.career + Habr the corpus skews crypto and RU-market. "Job-market intelligence"
 overclaims — call it a remote job search agent over heterogeneous boards, and the niche sourcing
@@ -214,8 +181,9 @@ catch fabrication.
       the two drift and the scores stop meaning anything.
 - [ ] Finalize the Pydantic schema (decisions locked below; five known defects to fix)
 - [ ] Extraction pipeline: JSON mode + retry on validation failure
-- [ ] Hand-label `evals/gold_30_labeled.json` — against the **frozen snapshot** (Phase 1b), keyed on
-      `(source, external_id)`, committed to git. Never label against the live rolling DB.
+- [ ] Hand-label `evals/gold_labeled.json` — against the **frozen snapshot** (Phase 1b), keyed on
+      `(source, external_id)`, committed to git. Never label against the live rolling DB. Sample
+      across all four sources so every adapter has coverage.
 - [ ] Eval script: per-field accuracy (exact match for enums/numbers, set-F1 for `stack[]`,
       containment for `source_quotes`) + role-count accuracy + role alignment
 - [ ] Langfuse wired into every extraction call
@@ -272,9 +240,9 @@ catch fabrication.
 - Whether to keep `pydantic-ai`. It handles validate-and-retry natively — write the manual loop
   once first (~20 lines: call → `model_validate_json()` → catch `ValidationError` → feed the error
   text back → retry), then adopt the framework knowing what it hides.
-- The gold set's role-split signal rests **entirely on the 10 HN rows** — Adzuna and Remotive are
-  1-posting-1-role by construction, so their role-count ground truth is trivially `1`. Consider
-  hand-picking a few more multi-role HN postings before labeling.
+- The gold set's role-split signal rests **entirely on the HN rows** — Remotive, Web3 and Habr are
+  1-posting-1-role by construction, so their role-count ground truth is trivially `1`. Weight the
+  resampled set toward HN, and hand-pick a few multi-role postings rather than sampling at random.
 
 ## Phase 3 — Storage + retrieval
 

@@ -22,32 +22,22 @@ retrieval/agent lab is the separate **product-search** repo. Built skill-by-skil
 - Watch my token budget: prefer a fresh session per phase over dragging a long context around, and
   say so when a wrap-up + new session is the cheaper move.
 
-**Where we left off (2026-08-11):** the last session produced **decisions, not code** — nothing was
-implemented. The project is being repointed at remote-only sources with a rolling 90-day freshness
-window; corpus size is explicitly no longer a goal. Full write-up is **Phase 1b in ROADMAP.md**
-(source-by-source probe results, retention rules, frozen-eval-DB design) — read that section before
-touching ingestion.
-
-Short version: **HN stays** (rolling; the only pure-prose source), **Remotive stays**,
-**Web3.career and Habr Career get added**, **Adzuna is cut**, **CryptoJobsList is parked** (no
-usable public feed — its RSS returns zero items and the site API is Cloudflare-guarded). API keys
-were applied for at Web3.career, CryptoJobsList, and Habr on 2026-08-10, expected back 2026-08-11.
-**Habr needs no key** — its frontend API answered fine unauthenticated — so it's unblocked either way.
-
-Phase 2 is still designed but not implemented; the schema decisions and the five `pydantic-ai` spike
-defects in ROADMAP.md are unchanged and still the plan.
+**Where we left off (2026-08-12):** **ingestion is done — all four sources are live.** The Habr
+client landed, so the corpus is now 1,098 rows — hn 502, habr 460, web3 100, remotive 36, all inside
+the 90-day window, zero Adzuna. `load.py` runs four independent source pipelines and each fetcher is
+handed the `external_id`s already stored for its source; only Habr uses them, because only Habr pays
+one HTTP request per posting for its prose. A cold Habr run is ~15 min, a warm one 35s. All 460 Habr
+rows carry a `description_html` (avg 2,786 chars, none missing). ruff and mypy are clean.
 
 **Next up (in order):**
-1. **Take the frozen snapshot — before anything deletes rows.** Only step with a real deadline:
-   4,176 HN rows fall outside the 90-day window and are unrecoverable once purged. ~2.9 MB
-   compressed, commit it. Design and exact commands are in ROADMAP.md Phase 1b.
-2. **Fix the broken working tree** — `hn_client.py` lost `find_hiring_threads()` but `load.py:12`
-   still imports it, so `load.py` won't even import. 8 ruff errors alongside it.
-3. `003_*.sql` — widen the `source` CHECK for `web3`/`habr`, `posted_at NOT NULL`, add `db_meta`.
-4. Restore `jobmarket_eval` + read-only role; then purge + ingest-side age filter behind the
-   `db_meta` guard.
-5. Habr client (unblocked), then Web3.career client once the key lands.
-6. Only then back to Phase 2: source adapters → finalize schema → label the gold set → eval script.
+1. **Snapshot the four-source corpus**, then resample the gold set per source from it. The old
+   pre-pivot dump was deleted — it predated web3 and habr, so it could only label half the sources.
+2. **Restore `jobmarket_eval`** from that snapshot + create the read-only role, then
+   `UPDATE db_meta SET role = 'eval'` in it.
+3. **Cache a fixture response per source** so the demo path runs offline.
+4. **Phase 2**: source adapters → finalize the Pydantic schema → label the gold set against the
+   frozen snapshot → eval script. The schema decisions and the five `pydantic-ai` spike defects in
+   ROADMAP.md are unchanged and still the plan.
 
 **Watch out:**
 - Docker needs no babysitting — systemd service, enabled at boot, user is in the `docker` group. A
@@ -60,32 +50,31 @@ defects in ROADMAP.md are unchanged and still the plan.
   sourced it passes an empty string and pg_dump falls back to the container socket as user `root`
   (`FATAL: role "root" does not exist`). Either `set -a; . ./.env; set +a` first, or pass
   `-U jobmarket -d jobmarket` explicitly. Same trap as the `psycopg.connect()` one.
-- `.env` line `WEB3_API_KEY =` has a space before `=` — bash reads it as a command when sourcing,
-  and python-dotenv doesn't see the key name you expect. Fix it.
-- Web3.career without a valid token **302s to its sales page** rather than erroring; `web3_client.py`
-  swallows that in a catch-all `except` and returns `[]`. Five more defects in that file are listed
-  in ROADMAP.md Phase 1b — it was written before a token existed, so its field names are guesses.
-- Habr's list endpoint has **no description text** — cards only. The posting prose needs an HTML
-  parse of `/vacancies/{id}`; the JSON detail endpoint just serves the SPA shell.
-- `adzuna_client.py`'s retry logic only catches `ConnectionError`/`Timeout` — a 429 or 5xx still
-  kills the whole `load.py` run. Known, not fixed, and now lower priority since Adzuna is cut as a
-  live source (its rows stay in the frozen eval DB).
-- The old note that "276 HN rows have NULL `posted_at`" is **stale** — verified 0 NULLs on
-  2026-08-11. The 276 is the count of HN rows *inside* the 90-day window, which is a coincidence.
-- The gold-set's random (not hand-curated) selection is a real quality tradeoff — worth revisiting
-  if Phase 2 eval accuracy looks off and the postings themselves turn out to be too easy/uniform.
-  It is also **no longer regenerable** once the purge runs, hence step 1.
-- `hn_client.py`, `remotive_client.py`, and `adzuna_client.py` have no docstrings/comments —
-  deliberate, don't flag it again.
-- Adzuna's `salary_min`/`salary_max` are **imputed** on 9 of 10 gold rows
-  (`"salary_is_predicted": "1"`, tell: min == max exactly). Only `"0"` rows are usable as salary
-  ground truth. Its `description` is also truncated at ~1.5KB, so held-out fields often have no
-  evidence in the input — legitimate nulls, not extraction misses.
+- **`purge.py` deletes rows that the boards will not serve again**, and **there is currently no
+  snapshot at all** — the pre-pivot dump was deleted. It is dry-run by default and refuses to run
+  unless `db_meta.role = 'live'`, but snapshot before the next purge.
+- **`conn.transaction()` on an idle psycopg connection is a real `BEGIN`/`COMMIT`, not a savepoint.**
+  It only nests as a savepoint inside an open transaction — which is why `upsert_posting` opens an
+  explicit outer block, and why the `known_ids` `SELECT` in `load_source` is wrapped in one too. A
+  bare `SELECT` leaves the connection `INTRANS` and silently demotes the next block to a savepoint.
+- Web3.career: hard cap of 100 jobs per call, `page`/`offset` are ignored, dates are RFC 2822 (use
+  `date_epoch`), and an invalid token 302s to the sales page instead of erroring. Its ToS requires
+  linking back via `apply_url` and crediting web3.career as the source.
+- Habr: the list endpoint has **no description text** — cards only, so the prose comes from an HTML
+  parse of `/vacancies/{id}` (`div.vacancy-description__text`); the JSON detail endpoint serves the
+  SPA shell. `per_page=50` is the real cap — a larger value is echoed back in `meta.perPage` but
+  still yields 50 rows, so page off `meta.totalPages`. Its offset pagination over a live date-desc
+  feed is **racy**: a posting published mid-run shifts the pages and duplicates a boundary card
+  (459 cards → 458 ids on the first run), so `fetch_habr_rows` dedupes by id.
+- **Imputed salaries are not ground truth:** Web3's `estimated_*` and Habr's `predictedSalary` are
+  the sites' own guesses. Only Web3's `salary_min_value`/`salary_max_value` and Habr's
+  `salary.from`/`salary.to` are employer-stated.
+- The gold set is being resampled from the new four-source snapshot. Random selection was a known
+  quality tradeoff — this time weight it toward HN (the only multi-role source) and hand-pick a few
+  messy postings. The old 30 rows survive with full `raw_text` in `evals/gold_30_candidates.json`.
+- The ingestion clients have no docstrings/comments — deliberate, don't flag it again.
 - `experiments/` is a scratchpad: never imported by `src/`, relative paths fine, no tests. A cell
-  graduates to `src/` as a function with a test. The failure mode is a notebook that quietly
-  becomes load-bearing. `experiments/.ipynb_checkpoints/` still isn't gitignored, and
-  `experiments/` is untracked — decide before the next commit whether notebooks get committed
-  (if so, strip outputs, e.g. `nbstripout`).
+  graduates to `src/` as a function with a test. `.gitignore` now excludes `experiments/*` entirely.
 
 Start by checking the current state of the repo in case I've changed things since.
 

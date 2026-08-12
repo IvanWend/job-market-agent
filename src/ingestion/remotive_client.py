@@ -7,7 +7,8 @@ def fetch_latest_jobs(url: str) -> list[dict]:
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    return data.get("jobs", [])
+    jobs: list[dict] = data.get("jobs", [])
+    return jobs
 
 
 if __name__ == "__main__":

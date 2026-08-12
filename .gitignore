@@ -10,6 +10,7 @@ __pycache__/
 data/
 evals/candidates_*.json
 evals/gold_30_candidates.json
+experiments/*
 
 # Tooling caches
 .ruff_cache/

@@ -7,9 +7,13 @@ __pycache__/
 .env
 
 # Ingested data / gold-set working copies
+docs/DB_CONNECT.md
+docs/DB_INSPECT.md
+docs/DB_MANAGE.md
 data/
 evals/candidates_*.json
-evals/gold_30_candidates.json
+# Working copies carry raw_text; only evals/gold_labeled.json is committed.
+evals/gold_*_candidates.json
 experiments/*
 
 # Tooling caches

@@ -9,7 +9,8 @@ backend roles"*, *"which postings match this résumé"*. Portfolio project; seco
 **Status:** ingestion **done**. All four source clients — HN, Remotive, Web3.career, Habr Career —
 plus the idempotent loader and the retention purge are working and verified. The corpus is
 remote-only and kept to a **rolling 90-day window** — **1,098 postings** (HN 502, Habr 460, Web3 100,
-Remotive 36). Phase 2 (extraction + evals) starts next. See
+Remotive 36). The eval baseline is frozen (`jobmarket_eval`, read-only role) and the 40-row gold-set
+candidate pool is sampled. Phase 2 (extraction + evals) starts next. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is built vs. planned, and
 [docs/PROMPT.md](docs/PROMPT.md) for the session-kickoff brief.
 
@@ -62,6 +63,8 @@ days are mostly filled and only add noise to retrieval.
 - **HN "Who is Hiring" (primary)** — monthly threads via the free Algolia HN API
   (`hn.algolia.com/api/v1`); top-level comments are job postings, pure prose. No auth. One thread
   per run; a 90-day window holds about three, and the idempotent upsert makes repeat runs free.
+  "One top-level comment = one posting" is a **convention, not an enforced rule** — a small share are
+  discussion, spam or misplaced résumés, sorted out in the extraction layer, not at ingest.
 - **Web3.career** — token-gated (free, email-gated). Hard cap of 100 jobs per call; `page` and
   `offset` are ignored, so breadth comes from repeating per `tag`. Full HTML `description`. Its
   `estimated_*` salary fields are the site's own guess, not employer-stated — not ground truth.
@@ -84,19 +87,23 @@ days are mostly filled and only add noise to retrieval.
 
 ```python
 class Posting(BaseModel):
+    doc_type: Literal["posting", "candidate", "other"]   # non-postings score as themselves
     company: str | None
     title: str | None
     seniority: Literal["intern", "junior", "mid", "senior", "staff+", "unknown"]
-    skills: list[str]                 # normalized lowercase, e.g. "python", "kubernetes"
-    stack: list[str]                  # frameworks/infra (skills-vs-stack boundary TBD)
-    salary_min: int | None            # annualized
+    stack: list[str]                  # one list; synonyms folded by a Python alias map
+    salary_min: int | None            # monthly; LLM extracts verbatim, Python converts
     salary_max: int | None
-    salary_currency: str | None       # ISO 4217
+    salary_currency: str | None       # ISO 4217, never converted
     remote_policy: Literal["remote", "hybrid", "onsite", "unknown"]
     location: str | None
     employment_type: Literal["full-time", "part-time", "contract", "unknown"]
     source_quotes: dict[str, str]     # field -> verbatim quote grounding the value
 ```
+
+A multi-role posting splits into **one record per role** (`company` posting-level, `title`/
+`seniority` role-level, the rest inherit-with-override), so `structured_postings` is 1:N with
+`raw_postings`. Details and the open questions are in the [roadmap](docs/ROADMAP.md#phase-2--extraction--evals).
 
 **Database schema** (Postgres — `raw_postings` finalized, others draft):
 
@@ -134,8 +141,9 @@ idle-in-transaction and demote `upsert_posting`'s transaction to a savepoint.
 
 ## Setup
 
-> Everything below is working today: `raw_postings` DDL, the three ingestion clients (HN, Remotive,
-> Web3.career), the loader (idempotent upsert, verified end-to-end), and the retention purge.
+> Everything below is working today: `raw_postings` DDL, the four ingestion clients (HN, Remotive,
+> Web3.career, Habr Career), the loader (idempotent upsert, verified end-to-end), and the retention
+> purge.
 
 Developed on **WSL2 Ubuntu** with Docker Engine running natively in WSL (systemd) — *not* Docker
 Desktop. Requirements: Python 3.12+ (3.13 pinned via `.python-version`),
@@ -168,6 +176,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/004_source_check.sql
 #   DATABASE_URL=postgresql://jobmarket:...@localhost:5432/jobmarket
 #   WEB3_API_KEY=...        # free, email-gated at web3.career
 #   DEEPSEEK_API_KEY=sk-...
+#   EVAL_DATABASE_URL=...   # jobmarket_ro @ jobmarket_eval — the frozen snapshot
 #   (POSTGRES_PASSWORD and the password embedded in DATABASE_URL must match, or step 3+ fails
 #   with "password authentication failed")
 
@@ -180,11 +189,20 @@ uv run python -m src.ingestion.purge --apply    # actually deletes
 ```
 
 **Take a snapshot before the first purge on a corpus you care about** — the deleted rows are not
-re-fetchable from the boards. No snapshot exists yet; the next one is taken from all four sources:
+re-fetchable from the boards. `evals/snapshots/2026-08-12_raw.dump` is the current one; re-snapshot
+to a **new date-stamped filename**, never in place:
 
 ```bash
 docker exec job-market-agent-db-1 pg_dump -U jobmarket -d jobmarket \
   -Fc -Z9 -t raw_postings > evals/snapshots/$(date +%F)_raw.dump
+```
+
+Evals run against that snapshot restored into `jobmarket_eval` (`db_meta.role = 'eval'`), reached
+via `EVAL_DATABASE_URL` as `jobmarket_ro` — a role with `SELECT` and nothing else, which is what
+actually keeps the baseline frozen. Rebuild the gold-set candidate pool with:
+
+```bash
+uv run python -m evals.generate_gold_dataset   # → evals/gold_40_candidates.json (git-ignored)
 ```
 
 **WSL2 + mirrored networking gotcha:** if step 2 fails with `failed to bind host port ... address
@@ -225,7 +243,7 @@ src/
     load.py            # per-source pipelines → window filter → idempotent upsert
     purge.py           # deletes cut sources + aged-out rows; dry-run by default, db_meta-guarded
 evals/
-  generate_gold_dataset.py  # pulls gold-set candidate rows from raw_postings
+  generate_gold_dataset.py  # seeded 40-row gold-set sample from the frozen snapshot
   snapshots/                # frozen dumps — eval inputs, committed
 docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log

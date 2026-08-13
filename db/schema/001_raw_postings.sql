@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS raw_postings (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT raw_postings_source_valid
-        CHECK (source IN ('hn', 'remotive', 'adzuna')),
+        CHECK (source IN ('hn', 'remotive', 'web3', 'habr')),
 
     -- Arbitrates the loader's ON CONFLICT. Same external_id from two sources is fine.
     CONSTRAINT raw_postings_source_external_id_key

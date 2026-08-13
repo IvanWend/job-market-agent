@@ -22,22 +22,15 @@ retrieval/agent lab is the separate **product-search** repo. Built skill-by-skil
 - Watch my token budget: prefer a fresh session per phase over dragging a long context around, and
   say so when a wrap-up + new session is the cheaper move.
 
-**Where we left off (2026-08-12):** **ingestion is done — all four sources are live.** The Habr
-client landed, so the corpus is now 1,098 rows — hn 502, habr 460, web3 100, remotive 36, all inside
-the 90-day window, zero Adzuna. `load.py` runs four independent source pipelines and each fetcher is
-handed the `external_id`s already stored for its source; only Habr uses them, because only Habr pays
-one HTTP request per posting for its prose. A cold Habr run is ~15 min, a warm one 35s. All 460 Habr
-rows carry a `description_html` (avg 2,786 chars, none missing). ruff and mypy are clean.
+**Where we left off (2026-08-13):** **Phase 1 is closed.** Ingestion, the frozen eval DB, and the
+gold-set sample are all done and verified — 1,098 rows, `jobmarket_eval` restored with
+`db_meta.role = 'eval'` behind the read-only `jobmarket_ro`, and `evals/gold_40_candidates.json`
+sampled reproducibly (seed `20260813`, hn 16 / habr 10 / web3 8 / remotive 6). ROADMAP.md now covers
+only what is left; it opens with a data-flow diagram. ruff and mypy are clean.
 
-**Next up (in order):**
-1. **Snapshot the four-source corpus**, then resample the gold set per source from it. The old
-   pre-pivot dump was deleted — it predated web3 and habr, so it could only label half the sources.
-2. **Restore `jobmarket_eval`** from that snapshot + create the read-only role, then
-   `UPDATE db_meta SET role = 'eval'` in it.
-3. **Cache a fixture response per source** so the demo path runs offline.
-4. **Phase 2**: source adapters → finalize the Pydantic schema → label the gold set against the
-   frozen snapshot → eval script. The schema decisions and the five `pydantic-ai` spike defects in
-   ROADMAP.md are unchanged and still the plan.
+**Next up:** Phase 2 in ROADMAP order — source adapters → finalize the Pydantic schema (five spike
+defects + the new `doc_type` enum) → hand-label `evals/gold_labeled.json` → eval script → Langfuse.
+Offline fixtures per source are still unbuilt and belong in the same phase.
 
 **Watch out:**
 - Docker needs no babysitting — systemd service, enabled at boot, user is in the `docker` group. A
@@ -46,35 +39,21 @@ rows carry a `description_html` (avg 2,786 chars, none missing). ruff and mypy a
 - Proxy: `~/.proxy.env` is the single source of truth. Never put globs (`127.*`, `<local>`) in
   `no_proxy` — `requests`/`httpx` don't honor them the way `curl` does, and localhost calls silently
   route through the proxy.
-- `docker exec ... pg_dump "$DATABASE_URL"` expands the variable on the **host** — if `.env` wasn't
-  sourced it passes an empty string and pg_dump falls back to the container socket as user `root`
-  (`FATAL: role "root" does not exist`). Either `set -a; . ./.env; set +a` first, or pass
-  `-U jobmarket -d jobmarket` explicitly. Same trap as the `psycopg.connect()` one.
-- **`purge.py` deletes rows that the boards will not serve again**, and **there is currently no
-  snapshot at all** — the pre-pivot dump was deleted. It is dry-run by default and refuses to run
-  unless `db_meta.role = 'live'`, but snapshot before the next purge.
-- **`conn.transaction()` on an idle psycopg connection is a real `BEGIN`/`COMMIT`, not a savepoint.**
-  It only nests as a savepoint inside an open transaction — which is why `upsert_posting` opens an
-  explicit outer block, and why the `known_ids` `SELECT` in `load_source` is wrapped in one too. A
-  bare `SELECT` leaves the connection `INTRANS` and silently demotes the next block to a savepoint.
-- Web3.career: hard cap of 100 jobs per call, `page`/`offset` are ignored, dates are RFC 2822 (use
-  `date_epoch`), and an invalid token 302s to the sales page instead of erroring. Its ToS requires
-  linking back via `apply_url` and crediting web3.career as the source.
-- Habr: the list endpoint has **no description text** — cards only, so the prose comes from an HTML
-  parse of `/vacancies/{id}` (`div.vacancy-description__text`); the JSON detail endpoint serves the
-  SPA shell. `per_page=50` is the real cap — a larger value is echoed back in `meta.perPage` but
-  still yields 50 rows, so page off `meta.totalPages`. Its offset pagination over a live date-desc
-  feed is **racy**: a posting published mid-run shifts the pages and duplicates a boundary card
-  (459 cards → 458 ids on the first run), so `fetch_habr_rows` dedupes by id.
-- **Imputed salaries are not ground truth:** Web3's `estimated_*` and Habr's `predictedSalary` are
-  the sites' own guesses. Only Web3's `salary_min_value`/`salary_max_value` and Habr's
-  `salary.from`/`salary.to` are employer-stated.
-- The gold set is being resampled from the new four-source snapshot. Random selection was a known
-  quality tradeoff — this time weight it toward HN (the only multi-role source) and hand-pick a few
-  messy postings. The old 30 rows survive with full `raw_text` in `evals/gold_30_candidates.json`.
-- The ingestion clients have no docstrings/comments — deliberate, don't flag it again.
+- **`purge.py` deletes rows the boards will not serve again.** `evals/snapshots/2026-08-12_raw.dump`
+  is the only copy and is still **untracked** — commit it before the next purge, or a `git clean`
+  takes it.
+- `docker exec ... pg_dump "$DATABASE_URL"` expands the variable on the **host** — an unsourced
+  `.env` passes an empty string and pg_dump falls back to the container socket as `root`
+  (`FATAL: role "root" does not exist`). `set -a; . ./.env; set +a` first, or pass
+  `-U jobmarket -d jobmarket`. Same trap as bare `psycopg.connect()`.
+- The ingestion clients and `generate_gold_dataset.py` carry no docstrings and few comments —
+  deliberate, don't flag it again.
 - `experiments/` is a scratchpad: never imported by `src/`, relative paths fine, no tests. A cell
-  graduates to `src/` as a function with a test. `.gitignore` now excludes `experiments/*` entirely.
+  graduates to `src/` as a function with a test. `.gitignore` excludes `experiments/*` entirely.
+
+Everything else that used to live here — Habr/Web3 API quirks, imputed salaries, the Habr labeling
+rules, the spike defects — is now in ROADMAP.md under "Durable gotchas" and Phase 2. Don't duplicate
+it back into this file.
 
 Start by checking the current state of the repo in case I've changed things since.
 

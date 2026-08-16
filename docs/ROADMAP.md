@@ -1,9 +1,6 @@
 # Roadmap
 
 The **service / infrastructure** half of my AI-engineering portfolio, built one phase at a time.
-Phase 1 (ingestion) and 1b (remote-source pivot, 90-day window, frozen eval DB) are **done and
-removed from this document** — see the README for how ingestion works. What follows is the current
-state and everything still to build.
 
 ## Data flow
 
@@ -120,12 +117,14 @@ Carried forward because they bite in *later* phases, not because they were hard 
 field carries a **verbatim source quote**, and evals check quote-in-text containment — not just
 values — to catch fabrication.
 
+- [x] **`src/extraction/normalize.py`** — pure helpers shared by the adapter and the model path.
+      Verified over all 40 gold rows. `remote_policy_enum()` still in progress.
 - [ ] **Source adapters** (`src/extraction/source_adapters.py`) — `(source, raw_text)` →
       `ExtractionInput(text, ground_truth)`. Lives in the extraction pipeline, **not** the loader:
       keeps `raw_postings` lossless, needs no re-ingest, stays a pure function testable off a
       fixture. The **only** place that knows source-specific JSON shape — if the eval script
       re-parses `raw_text` on its own, the two drift and the scores stop meaning anything.
-- [ ] Finalize the Pydantic schema (decisions locked below; five known defects to fix)
+- [ ] Finalize the Pydantic schema (`src/extraction/schema.py`; layout below, five defects to fix)
 - [ ] Extraction pipeline: JSON mode + retry on validation failure
 - [ ] Hand-label `evals/gold_labeled.json` from `gold_40_candidates.json`, keyed on
       `(source, external_id)`, committed to git
@@ -235,6 +234,8 @@ Cyrillic→Latin homoglyphs (`СсАаЕеОоРрХх`) before alias lookup.
   days/week in office (the spike chose hybrid — the better read). This recurs across HN; pick a
   tiebreak rule and put it in *both* the prompt and the labeling notes, or gold and model will
   disagree for reasons that aren't extraction quality.
+- **Compound seniority.** `"Mid-Senior/Senior"` (HN `48749201`) matches no alias key and falls to
+  `unknown`. Add compound keys, or rule that a range rounds up.
 - **Whether to keep `pydantic-ai`.** It handles validate-and-retry natively — write the manual loop
   once first (~20 lines: call → `model_validate_json()` → catch `ValidationError` → feed the error
   back → retry), then adopt the framework knowing what it hides.

@@ -33,8 +33,8 @@ The **service / infrastructure** half of my AI-engineering portfolio, built one 
   │            (verbatim: amounts, periods, quotes)     │   │                                   │
   │                          │ ValidationError → retry  │   │                                   │
   │                          ▼                          ▼   ▼                                   │
-  │                   normalize()  ────────────────►  eval script  ◄──── evals/gold_labeled.json │
-  │                   (÷12, alias map, fill-down)      per-field + role-count + quote            │
+  │                   transform()  ────────────────►  eval script  ◄──── evals/gold_labeled.json │
+  │                   (fill-down, ÷12, alias map)      per-field + role-count + quote            │
   │                          │                          containment                             │
   └──────────────────────────┼─────────────────────────────────────────────────────────────────┘
                              ▼
@@ -49,7 +49,14 @@ The **service / infrastructure** half of my AI-engineering portfolio, built one 
 
 Every LLM call is traced to Langfuse from the first one.
 
-## Current state (2026-08-13)
+## Current state (2026-08-16)
+
+**Phase 2 — extraction path is wired end to end.** `adapter → LLM → validators → transform →
+NormalizedRole` runs on all four sources. Verified on one row per source: 31 quotes, 1 containment
+miss (line wrapping, see below). `normalize.py`, `schema.py`, `source_adapters.py` and
+`transform.py` are done; the pipeline module, labeling, eval script and Langfuse are not.
+
+
 
 **Corpus** — 1,098 rows, remote-only, all inside the rolling 90-day window:
 
@@ -93,6 +100,19 @@ Carried forward because they bite in *later* phases, not because they were hard 
 - **Held-out truth with no evidence in the input is a legitimate null**, not an extraction miss —
   the eval must score it that way whenever a source's structured field outruns its prose.
 - **Not every HN row is a job posting.** See the Phase 2 decision below.
+- **Quote containment runs against `html_to_text(raw_text)`, never `raw_text`.** HN raw text holds
+  `&amp;` and `&#x2F;`; the model quotes the rendered `&` and `/`, so *every* HN quote fails against
+  `raw_text`. Measured: the same quote is `False` in `raw_text` and `True` in the cleaned text. The
+  LLM must be fed that same cleaned string, or the two drift again.
+- **Containment must normalize whitespace on both sides.** Source prose is hard-wrapped mid-sentence
+  (`ERC-7540 (async\nvaults)`); the model quotes it with a space. Compare
+  `" ".join(q.split())` against `" ".join(text.split())` — the fix belongs in the eval script, not in
+  `html_to_text`, which has to keep paragraph structure.
+- **`to_number` must handle magnitude suffixes.** The LLM extracts verbatim, so `"$180k"` and
+  `"1.5M"` arrive as written and bare `float()` raises. Without this every HN salary is silently
+  dropped.
+- **Habr states currency as `'rur'`, which is not ISO 4217.** `currency_enum()` maps it, plus
+  symbols. Anything unrecognized returns `None` rather than putting junk in an ISO column.
 - **`psycopg.connect()` with no argument silently falls back to a local Unix socket** instead of
   reading `DATABASE_URL` — always pass the string explicitly. Same trap in the shell:
   `docker exec ... pg_dump "$DATABASE_URL"` expands on the *host*, so an unsourced `.env` passes an
@@ -117,15 +137,21 @@ Carried forward because they bite in *later* phases, not because they were hard 
 field carries a **verbatim source quote**, and evals check quote-in-text containment — not just
 values — to catch fabrication.
 
-- [x] **`src/extraction/normalize.py`** — pure helpers shared by the adapter and the model path.
-      Verified over all 40 gold rows. `remote_policy_enum()` still in progress.
-- [ ] **Source adapters** (`src/extraction/source_adapters.py`) — `(source, raw_text)` →
-      `ExtractionInput(text, ground_truth)`. Lives in the extraction pipeline, **not** the loader:
-      keeps `raw_postings` lossless, needs no re-ingest, stays a pure function testable off a
+- [x] **`src/extraction/normalize.py`** — pure helpers, model-free, shared by the adapter and the
+      model path. Verified over all 40 gold rows.
+- [x] **Source adapters** (`src/extraction/source_adapters.py`) — `(source, external_id, raw_text)` →
+      `ExtractionInput(text, ground_truth, prefilter)`. Lives in the extraction pipeline, **not** the
+      loader: keeps `raw_postings` lossless, needs no re-ingest, stays a pure function testable off a
       fixture. The **only** place that knows source-specific JSON shape — if the eval script
-      re-parses `raw_text` on its own, the two drift and the scores stop meaning anything.
-- [ ] Finalize the Pydantic schema (`src/extraction/schema.py`; layout below, five defects to fix)
-- [ ] Extraction pipeline: JSON mode + retry on validation failure
+      re-parses `raw_text` on its own, the two drift and the scores stop meaning anything. All 40
+      gold rows adapt clean; zero prefiltered (`EXCLUDED_HN` already kept junk out of the sample).
+- [x] Pydantic schema (`src/extraction/schema.py`) — four models, five validators, all five spike
+      defects fixed and reproduced-then-caught in a live run.
+- [x] **`src/extraction/transform.py`** — fill-down + conversion, `PostingExtraction` →
+      `NormalizedPosting`. Separate module so `normalize.py` stays model-free: `transform` imports
+      both, neither imports it.
+- [ ] Extraction pipeline: JSON mode + retry on validation failure. Currently only
+      `experiments/spike_extract.py`, which has no retry loop.
 - [ ] Hand-label `evals/gold_labeled.json` from `gold_40_candidates.json`, keyed on
       `(source, external_id)`, committed to git
 - [ ] Eval script: per-field accuracy (exact match for enums/numbers, set-F1 for `stack[]`,
@@ -161,6 +187,30 @@ values — to catch fabrication.
   - Eval can't compare positionally. Score role *count* first, then greedy-match predicted↔gold on
     normalized title, then per-field score only matched pairs; report unmatched as precision/recall
     loss.
+
+### Schema decisions locked while building it — 2026-08-16
+
+- **Salary is a fifth inheritable field group**, not posting-only. HN `49157647` states a
+  posting-level band *and* per-role overrides (`senior band $170K-$210K`). `INHERITABLE_FIELDS` is
+  therefore eight names, salary's four among them.
+- **`stack` unions on fill-down; the other seven replace.** Replacing would drop the shared stack
+  for exactly the roles that bothered to list their own. The one inheritable field that does not
+  behave like the rest — say so in the labeling notes.
+- **`"salary"` is a legal `source_quotes` key** even though it is not a field name: the four
+  `salary_*` fields share one verbatim quote. Allowed keys are `model_fields | {"salary"}`.
+- **`QUOTE_REQUIRED` is deliberately narrow** — `title`, `company`, `salary_min`, `salary_max`, the
+  fields where the spike actually fabricated. Requiring a quote for every non-null field sends the
+  retry loop into a storm over header tokens nobody quotes cleanly.
+- **A posting with `roles: []` gets one synthesized role** carrying the posting-level fields.
+  `structured_postings` is keyed on the role, so otherwise a single-role posting normalizes to
+  nothing.
+- **`ExtractionInput.ground_truth` carries an explicit `held_out` set.** Without it "this source has
+  no such field" is indistinguishable from "this source says null", and the eval punishes correct
+  nulls.
+- **Only Habr's salary reaches the monthly axis** (`salary_period_known=True`). Web3 states amounts
+  with `salary_currency` and `salary_unit` both `None` in all 8 gold rows; Remotive's `salary` is
+  free text mixing `"$3k - $10k"` with `"$150k - $230k"`. Amounts are carried unconverted in
+  `salary_raw`; the eval skips salary where the period is unknown rather than guessing.
 
 ### Not every HN row is a job posting — locked 2026-08-13
 
@@ -202,7 +252,7 @@ Normalize the enums, not the whole record.
 | `seniority` | normalize → English enum | Genuinely mixed: 195 rows senior/синьор, 160 middle/миддл, 82 lead/ведущий/тимлид, 38 junior/стажёр. The RU alias map earns its keep here. |
 | `stack` | already Latin — no translation layer | 190 rows carry Latin `Python`/`Docker`/`Kubernetes` vs **1** Cyrillic; PostgreSQL is 128 Latin vs 0 Cyrillic. Habr writes prose in Russian, tech names in Latin. |
 | `title` | keep **verbatim Russian** | Free text, not an enum. Translating adds an unmeasurable noise source and is unquotable. Habr is 1-role, so greedy-match never needs it cross-lingual. |
-| `source_quotes` | keep **verbatim Russian**, always | Containment runs against `raw_text`. Translate a quote and every Habr row fails for a reason unrelated to extraction quality. |
+| `source_quotes` | keep **verbatim Russian**, always | Containment runs against the adapter's cleaned text. Translate a quote and every Habr row fails for a reason unrelated to extraction quality. |
 
 Same shape as the salary rule — verbatim quote, derived value. Write it into the prompt and the
 labeling notes in those terms, so it reads as one principle rather than two exceptions.
@@ -211,7 +261,10 @@ labeling notes in those terms, so it reads as one principle rather than two exce
 folding, the alias map scores two different technologies. Cheapest fix is a `str.translate` of the
 Cyrillic→Latin homoglyphs (`СсАаЕеОоРрХх`) before alias lookup.
 
-### Five defects from the `experiments/` spike — fix these first
+### Five defects from the `experiments/` spike — all fixed 2026-08-16
+
+Each is now a validator in `schema.py`, and #2–#5 were reproduced live on HN `48747990` before the
+fix and caught by the validator after it. Kept here because the *reasons* still constrain the prompt.
 
 1. Spike passed `output_type=RoleExtraction`, so `PostingExtraction` went unused and the role split
    was never exercised. The postings originally named as replacements are 2023–24 HN ids, far
@@ -230,10 +283,30 @@ Cyrillic→Latin homoglyphs (`СсАаЕеОоРрХх`) before alias lookup.
 
 ### Still open
 
+**Settle these before hand-labeling — each one decides what a "correct" label is.**
+
+- **`stack` ground truth and extracted stack barely intersect.** Habr `1000162782`: held-out tags
+  normalize to `['waterfall']` (three Cyrillic process skills correctly dropped) against 14 extracted
+  security acronyms. Web3 `150580`: `['erc-20','smart-contract']` against 19 extracted. Set-F1 is
+  near zero and the extraction isn't wrong — card tags and prose describe different things. Decide
+  whether `stack` is scored against tags at all, or only against hand labels.
+- **Card-vs-body conflicts, not just header-vs-body.** Habr `1000162782`: card says
+  `remoteWork=True`, prose says hybrid; card company `ИТ-Холдинг Т1` vs extracted `Т1`; card title
+  `Специалист по информационной безопасности` vs extracted `Специалист ИБ`. Remotive `2090949`: card
+  title `High-Ticket Financial Sales Specialist & Team Lead Track` vs the body's own
+  `Account Executive / B2B Sales Specialist`. Same class as the HN header/body case below — one
+  tiebreak rule, written into *both* the prompt and the labeling notes.
 - **Header-vs-body conflicts.** One spike posting's header said `Onsite` while its body said 3
-  days/week in office (the spike chose hybrid — the better read). This recurs across HN; pick a
-  tiebreak rule and put it in *both* the prompt and the labeling notes, or gold and model will
-  disagree for reasons that aren't extraction quality.
+  days/week in office (the spike chose hybrid — the better read).
+- **`location` has no normalizer.** HN roles came out with `location="REMOTE (worldwide)"` — a remote
+  policy sitting in the location field. `remote_policy` normalized correctly off the same string, so
+  nothing is lost, but `location` is free text with junk in it.
+- **A quote for a `None` field is unchecked.** A role emitted `source_quotes["employment_type"]`
+  while leaving the field `None`; both validators pass it. A sixth check (quote keys ⊆ non-null
+  fields) would catch it — left out because it is a new rule, not a spike defect.
+- **Field placement is non-deterministic.** Two runs of the same posting put `stack` at posting level
+  once and role level the next. Fill-down absorbs it, but role-count and placement variance is noise
+  the eval has to tolerate.
 - **Compound seniority.** `"Mid-Senior/Senior"` (HN `48749201`) matches no alias key and falls to
   `unknown`. Add compound keys, or rule that a range rounds up.
 - **Whether to keep `pydantic-ai`.** It handles validate-and-retry natively — write the manual loop

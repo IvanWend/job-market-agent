@@ -26,20 +26,24 @@ retrieval/agent lab is the separate **product-search** repo. Built skill-by-skil
 - Watch my token budget: prefer a fresh session per phase over dragging a long context around, and
   say so when a wrap-up + new session is the cheaper move.
 
-**Where we left off (2026-08-16):** Phase 1 is closed — ingestion, the frozen eval DB (1,098 rows,
-`jobmarket_eval` behind the read-only `jobmarket_ro`) and the seeded gold-set sample are done and
-verified. Phase 2 has started: `src/extraction/normalize.py` is written and verified over all 40
-gold rows, with `remote_policy_enum()` half-finished at the bottom of the file.
+**Where we left off (2026-08-16):** Phase 1 is closed. Phase 2's extraction path is **wired end to
+end and verified** on one row per source — `source_adapters` → LLM → `schema` validators →
+`transform` → `NormalizedRole`. Four modules done: `normalize.py`, `schema.py`,
+`source_adapters.py`, `transform.py`. Uncommitted at wrap-up; ruff and mypy clean.
 
-**Next up:** finish `remote_policy_enum()` (takes a bool as well as a string — Web3 `is_remote`,
-Habr `remoteWork`) → `schema.py` → source adapters → hand-label `evals/gold_labeled.json` → eval
-script → Langfuse. Offline fixtures per source belong in the same phase.
+**Next up:** hand-label `evals/gold_labeled.json` → eval script → extraction pipeline module with
+the retry loop → Langfuse. Offline fixtures per source belong in the same phase.
 
-`schema.py` shape, agreed but not yet written: two verbatim models (`RoleExtraction`,
-`PostingExtraction`) plus a derived normalized pair. The four inheritable fields — `stack`,
-`location`, `remote_policy`, `employment_type` — sit on both, `| None` at role level meaning
-*inherit*. `source_quotes` is scoped to each model's own fields so the key check is
-`set(quotes) <= set(model_fields)`. One validator per spike defect.
+**Settle the four labeling questions in ROADMAP "Still open" before labeling** — each one decides
+what a correct label *is*, and relabeling 40 rows twice is the expensive mistake here. Shortest
+version: `stack` ground truth barely intersects extracted stack; card fields contradict body prose
+on Habr and Remotive; `location` has no normalizer; a quote for a `None` field goes unchecked.
+
+Two things that will bite the eval script specifically:
+- **Containment runs against `html_to_text(raw_text)`, never `raw_text`** — and must whitespace-
+  normalize both sides, because source prose is hard-wrapped mid-sentence.
+- **Only Habr's salary has a known period.** Web3 and Remotive amounts stay unconverted in
+  `salary_raw`; skip salary scoring there rather than guessing a period.
 
 **Watch out:**
 - Docker needs no babysitting — systemd service, enabled at boot, user is in the `docker` group. A
@@ -56,7 +60,10 @@ script → Langfuse. Offline fixtures per source belong in the same phase.
   (`FATAL: role "root" does not exist`). `set -a; . ./.env; set +a` first, or pass
   `-U jobmarket -d jobmarket`. Same trap as bare `psycopg.connect()`.
 - The ingestion clients, `generate_gold_dataset.py` and `normalize.py` carry no docstrings and few
-  comments — deliberate, don't flag it again and don't add them back.
+  comments — deliberate, don't flag it again and don't add them back. `schema.py`, `transform.py`
+  and `source_adapters.py` do carry short docstrings where a model's *contract* is non-obvious.
+- **Import direction inside `extraction/` is one-way:** `normalize` is model-free, `schema` and
+  `source_adapters` import it, `transform` imports both. Don't put fill-down back in `normalize.py`.
 - `experiments/` is a scratchpad: never imported by `src/`, relative paths fine, no tests. A cell
   graduates to `src/` as a function with a test. `.gitignore` excludes `experiments/*` entirely.
 

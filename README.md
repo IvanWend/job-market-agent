@@ -10,7 +10,9 @@ backend roles"*, *"which postings match this résumé"*. Portfolio project; seco
 plus the idempotent loader and the retention purge are working and verified. The corpus is
 remote-only and kept to a **rolling 90-day window** — **1,098 postings** (HN 502, Habr 460, Web3 100,
 Remotive 36). The eval baseline is frozen (`jobmarket_eval`, read-only role) and the 40-row gold-set
-candidate pool is sampled. Phase 2 (extraction + evals) starts next. See
+candidate pool is sampled. **Phase 2 in progress:** the extraction path runs end to end — source
+adapter → LLM → Pydantic validators → normalize/fill-down — across all four sources. Hand-labeling,
+the eval script and Langfuse are next. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for what is built vs. planned, and
 [docs/PROMPT.md](docs/PROMPT.md) for the session-kickoff brief.
 
@@ -83,27 +85,50 @@ days are mostly filled and only add noise to retrieval.
 
 ## Data model
 
-**Extraction schema** (Pydantic v2, draft — open questions tracked in the roadmap):
+**Extraction schema** (Pydantic v2, built — two layers, deliberately separate):
 
 ```python
-class Posting(BaseModel):
+# verbatim: what the LLM emitted, before any conversion
+class PostingExtraction(_Inheritable):
     doc_type: Literal["posting", "candidate", "other"]   # non-postings score as themselves
-    company: str | None
+    company: str | None                                  # posting-level only
+    roles: list[RoleExtraction]
+
+class RoleExtraction(_Inheritable):
     title: str | None
+    seniority: str | None             # a free string here, not an enum — see below
+
+class _Inheritable(BaseModel):        # None at role level means *inherit*, not absent
+    stack: list[str] | None
+    location: str | None
+    remote_policy: str | None
+    employment_type: str | None
+    salary_min / salary_max: str | float | None   # verbatim: "180k", "$3k"
+    salary_period / salary_currency: str | None   # verbatim: "year", "$"
+    source_quotes: dict[str, str]     # field -> verbatim quote grounding the value
+
+# derived: transform() fills down, converts, and is what gets stored
+class NormalizedRole(BaseModel):
+    role_index: int
     seniority: Literal["intern", "junior", "mid", "senior", "staff+", "unknown"]
-    stack: list[str]                  # one list; synonyms folded by a Python alias map
-    salary_min: int | None            # monthly; LLM extracts verbatim, Python converts
-    salary_max: int | None
+    stack: list[str]                  # synonyms folded by a Python alias map
+    salary_min / salary_max: int | None   # monthly
     salary_currency: str | None       # ISO 4217, never converted
     remote_policy: Literal["remote", "hybrid", "onsite", "unknown"]
-    location: str | None
     employment_type: Literal["full-time", "part-time", "contract", "unknown"]
-    source_quotes: dict[str, str]     # field -> verbatim quote grounding the value
+    ...
 ```
 
+The **enum-shaped fields stay free strings on the verbatim layer** on purpose: it keeps *the model
+misread the posting* and *my alias map has a gap* separately measurable. Conversion happens once, in
+`transform.py`, where it is unit-testable.
+
 A multi-role posting splits into **one record per role** (`company` posting-level, `title`/
-`seniority` role-level, the rest inherit-with-override), so `structured_postings` is 1:N with
-`raw_postings`. Details and the open questions are in the [roadmap](docs/ROADMAP.md#phase-2--extraction--evals).
+`seniority` role-level, the other eight inherit-with-override — `stack` unions rather than
+replaces), so `structured_postings` is 1:N with `raw_postings`. Five validators enforce the
+grounding rules: blank-string coercion, salary coherence, `source_quotes` keys must be real field
+names, required quotes on the fields where the spike fabricated, and the non-posting shape. Details
+and the open labeling questions are in the [roadmap](docs/ROADMAP.md#phase-2--extraction--evals).
 
 **Database schema** (Postgres — `raw_postings` finalized, others draft):
 
@@ -242,6 +267,11 @@ src/
     retention.py       # WINDOW_DAYS + cut sources, shared by the loader and the purge
     load.py            # per-source pipelines → window filter → idempotent upsert
     purge.py           # deletes cut sources + aged-out rows; dry-run by default, db_meta-guarded
+  extraction/
+    normalize.py       # pure helpers: html_to_text, enum alias maps, salary math. Model-free.
+    schema.py          # the four Pydantic models + five grounding validators. No I/O, no LLM.
+    source_adapters.py # (source, raw_text) -> ExtractionInput(text, ground_truth, prefilter)
+    transform.py       # fill-down + conversion: PostingExtraction -> NormalizedPosting
 evals/
   generate_gold_dataset.py  # seeded 40-row gold-set sample from the frozen snapshot
   snapshots/                # frozen dumps — eval inputs, committed
@@ -252,7 +282,10 @@ docs/
 
 Two schema mechanisms, one job each: `init/` is **bootstrap** (runs once, only when the data
 directory is empty) and `db/schema/` is the **re-runnable** path applied by hand. No file belongs in
-both — see the 2026-07-26 decision in the roadmap. There is no `tests/` yet, and the project is
+both — see the 2026-07-26 decision in the roadmap. Inside `extraction/` the imports run **one way**:
+`normalize` knows nothing about the models, `schema` and `source_adapters` import `normalize`, and
+`transform` imports both. That is why fill-down lives in its own module instead of in `normalize.py`
+— it keeps the helpers testable off plain strings. There is no `tests/` yet, and the project is
 intentionally not an installable package (no `[build-system]`), so imports are `src.ingestion.…`
 from the repo root.
 

@@ -25,6 +25,9 @@ _BLOCK_TAGS = [
 HOURS_PER_MONTH = 173.33  # 2080/12
 MONTHS_PER_YEAR = 12
 
+_CURRENCY_CHARS = re.compile(r"[$€£₽₸₴¥₹]")
+_MAGNITUDES = {"k": 1e3, "K": 1e3, "к": 1e3, "К": 1e3, "m": 1e6, "M": 1e6}
+
 _PERIODS: dict[str, str] = {
     "year": "year", "yearly": "year", "yr": "year", "annual": "year",
     "annually": "year", "per year": "year", "/year": "year", "pa": "year",
@@ -57,6 +60,33 @@ _EMPLOYMENT: dict[str, Employment] = {
     "contract": "contract", "contractor": "contract", "freelance": "contract",
     "temporary": "contract", "temp": "contract", "b2b": "contract",
     "фриланс": "contract", "подряд": "contract", "проектная работа": "contract",
+}  # fmt: skip
+
+# Habr states 'rur', a legacy code that is not ISO 4217. Symbols arrive from
+# prose, three-letter codes from the boards.
+_CURRENCIES: dict[str, str] = {
+    "rur": "RUB", "rub": "RUB", "руб": "RUB", "руб.": "RUB", "р.": "RUB", "₽": "RUB",
+    "usd": "USD", "$": "USD", "us$": "USD", "$usd": "USD", "долл": "USD",
+    "eur": "EUR", "€": "EUR", "gbp": "GBP", "£": "GBP",
+    "kzt": "KZT", "₸": "KZT", "uah": "UAH", "₴": "UAH", "byn": "BYN",
+    "inr": "INR", "₹": "INR", "jpy": "JPY", "cny": "CNY", "¥": "CNY",
+}  # fmt: skip
+
+_REMOTE: dict[str, RemotePolicy] = {
+    "remote": "remote", "fully remote": "remote", "fully-remote": "remote",
+    "100% remote": "remote", "100%-remote": "remote",
+    "remote first": "remote", "remote-first": "remote",
+    "wfh": "remote", "work from home": "remote", "work-from-home": "remote",
+    "distributed": "remote", "anywhere": "remote", "worldwide": "remote",
+    "удаленно": "remote", "удалённо": "remote",
+    "удаленная работа": "remote", "удалённая работа": "remote",
+    "hybrid": "hybrid", "partially remote": "hybrid", "partially-remote": "hybrid",
+    "flexible": "hybrid", "гибрид": "hybrid", "гибридный": "hybrid",
+    "onsite": "onsite", "on-site": "onsite", "on site": "onsite",
+    "on-premise": "onsite", "on premise": "onsite",
+    "in-office": "onsite", "in office": "onsite", "office": "onsite",
+    "in-person": "onsite", "in person": "onsite", "local": "onsite",
+    "офис": "onsite", "в офисе": "onsite",
 }  # fmt: skip
 
 # Seed, not a finished list. Grows from eval failures.
@@ -127,9 +157,18 @@ def blank_to_none(value: Any, extra: Iterable[str] = ()) -> Any:
 
 
 def to_number(value: float | str) -> float:
-    if isinstance(value, str):
-        return float(value.replace(",", "").replace(" ", "").replace("\xa0", "").strip())
-    return float(value)
+    if not isinstance(value, str):
+        return float(value)
+
+    # The LLM extracts verbatim, so "$180k" and "1.5M" arrive as written. Bare
+    # float() rejects both, which would silently cost every HN salary.
+    cleaned = _CURRENCY_CHARS.sub("", value).replace(",", "")
+    cleaned = _HORIZONTAL_WS.sub("", cleaned).strip()
+    multiplier = 1.0
+    if cleaned and cleaned[-1] in _MAGNITUDES:
+        multiplier = _MAGNITUDES[cleaned[-1]]
+        cleaned = cleaned[:-1]
+    return float(cleaned) * multiplier
 
 
 def to_monthly(amount: float | str, period: str) -> int:
@@ -199,4 +238,29 @@ def employment_enum(value: str | None) -> Employment:
 
 
 def remote_policy_enum(value: str | bool | None) -> RemotePolicy:
+    if isinstance(value, bool):
+        return "remote" if value else "unknown"
 
+    cleaned = blank_to_none(value)
+    if cleaned is None:
+        return "unknown"
+
+    key = _HORIZONTAL_WS.sub(" ", cleaned).strip().casefold().replace("_", "-")
+    return _REMOTE.get(key, "unknown")
+
+
+def currency_enum(value: str | None) -> str | None:
+    # Annotated because this is the one enum helper that returns a derived
+    # string rather than a Literal, so blank_to_none's Any would leak out.
+    cleaned: str | None = blank_to_none(value)
+    if cleaned is None:
+        return None
+
+    key = cleaned.strip().casefold()
+    if key in _CURRENCIES:
+        return _CURRENCIES[key]
+    # A bare three-letter ASCII code passes through as-is; anything else is not
+    # a currency, and returning it would put junk in an ISO 4217 column.
+    if len(key) == 3 and key.isascii() and key.isalpha():
+        return key.upper()
+    return None

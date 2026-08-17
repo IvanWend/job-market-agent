@@ -251,7 +251,7 @@ take the proxy. See the environment table in [docs/ROADMAP.md](docs/ROADMAP.md).
 ## Project structure
 
 ```
-pyproject.toml         # deps (uv) + ruff/mypy config; uv.lock is committed
+pyproject.toml         # deps (uv) + ruff/mypy/pytest config; uv.lock is committed
 .python-version        # 3.13 — uv reads this
 .env.example           # committed key names, no values; .env is git-ignored
 .gitattributes         # force LF (files cross into the Linux Postgres container)
@@ -272,12 +272,15 @@ src/
     schema.py          # the four Pydantic models + five grounding validators. No I/O, no LLM.
     source_adapters.py # (source, raw_text) -> ExtractionInput(text, ground_truth, prefilter)
     transform.py       # fill-down + conversion: PostingExtraction -> NormalizedPosting
+tests/
+  test_normalize.py    # parametrized unit tests over normalize.py's ten public functions
 evals/
   generate_gold_dataset.py  # seeded 40-row gold-set sample from the frozen snapshot
   snapshots/                # frozen dumps — eval inputs, committed
+CLAUDE.md              # stable brief: working style, conventions, environment gotchas (auto-loaded)
 docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log
-  PROMPT.md            # paste-to-start session kickoff brief
+  PROMPT.md            # volatile session state: where we left off / next up
 ```
 
 Two schema mechanisms, one job each: `init/` is **bootstrap** (runs once, only when the data

@@ -49,12 +49,17 @@ The **service / infrastructure** half of my AI-engineering portfolio, built one 
 
 Every LLM call is traced to Langfuse from the first one.
 
-## Current state (2026-08-16)
+## Current state (2026-08-17)
 
 **Phase 2 — extraction path is wired end to end.** `adapter → LLM → validators → transform →
 NormalizedRole` runs on all four sources. Verified on one row per source: 31 quotes, 1 containment
 miss (line wrapping, see below). `normalize.py`, `schema.py`, `source_adapters.py` and
 `transform.py` are done; the pipeline module, labeling, eval script and Langfuse are not.
+
+**`tests/` exists.** pytest is a dev dependency, `[tool.pytest.ini_options]` sets
+`testpaths`/`pythonpath`, and `tests/test_normalize.py` covers all ten public functions in
+`normalize.py` — 83 parametrized cases, every value drawn from `gold_40_candidates.json` rather
+than invented. `schema.py`, `source_adapters.py` and `transform.py` are still untested.
 
 
 
@@ -79,9 +84,10 @@ written into the output, `role='eval'` guard mirroring `purge.py`'s `'live'` gua
 by company prefix (145 of 502 rows are reposts across the July and August threads) and carries 6
 hand-picked multi-role postings as a module constant. Reruns are byte-identical.
 
-Toolchain (uv + ruff + mypy) clean.
+Toolchain (uv + ruff + mypy + pytest) clean.
 
-**Still to build:** offline fixtures · all of Phase 2 onward.
+**Still to build:** tests for the other three extraction modules · offline fixtures · the rest of
+Phase 2 onward.
 
 ## Durable gotchas
 
@@ -111,6 +117,13 @@ Carried forward because they bite in *later* phases, not because they were hard 
 - **`to_number` must handle magnitude suffixes.** The LLM extracts verbatim, so `"$180k"` and
   `"1.5M"` arrive as written and bare `float()` raises. Without this every HN salary is silently
   dropped.
+- **pytest cannot import `src` without `pythonpath = ["."]`.** No `[build-system]`, so nothing is
+  installed; under the default `prepend` import mode pytest puts only the *test file's* directory on
+  `sys.path` and `import src` fails at collection. Fixed in `[tool.pytest.ini_options]`. Don't
+  "fix" it with `tests/__init__.py` — that makes tests a package and changes rootdir resolution.
+- **A test function's parameters are fixture requests, not typed locals.** Copying the function
+  under test's signature onto the test gets `fixture 'value' not found` at setup, before any assert
+  runs. Parameters come from `@pytest.mark.parametrize` or they come from a fixture.
 - **Habr states currency as `'rur'`, which is not ISO 4217.** `currency_enum()` maps it, plus
   symbols. Anything unrecognized returns `None` rather than putting junk in an ISO column.
 - **`psycopg.connect()` with no argument silently falls back to a local Unix socket** instead of
@@ -150,6 +163,11 @@ values — to catch fabrication.
 - [x] **`src/extraction/transform.py`** — fill-down + conversion, `PostingExtraction` →
       `NormalizedPosting`. Separate module so `normalize.py` stays model-free: `transform` imports
       both, neither imports it.
+- [x] **`tests/test_normalize.py`** — 83 parametrized cases over all ten public functions. Fixtures
+      come from `gold_40_candidates.json`, not from imagination: `"full_time"` (habr + remotive),
+      `"rur"`, `"Middle"`, `remoteWork=True`, the Habr `skills` and Web3 `tags` arrays.
+- [ ] Tests for `schema.py`, `source_adapters.py`, `transform.py` — the adapters need the offline
+      fixtures below, so the two land together
 - [ ] Extraction pipeline: JSON mode + retry on validation failure. Currently only
       `experiments/spike_extract.py`, which has no retry loop.
 - [ ] Hand-label `evals/gold_labeled.json` from `gold_40_candidates.json`, keyed on
@@ -309,6 +327,14 @@ fix and caught by the validator after it. Kept here because the *reasons* still 
   the eval has to tolerate.
 - **Compound seniority.** `"Mid-Senior/Senior"` (HN `48749201`) matches no alias key and falls to
   `unknown`. Add compound keys, or rule that a range rounds up.
+- **Two `normalize.py` holes now pinned by tests as *current* behaviour, not correct behaviour.**
+  Each test carries a comment saying so; update the test when the rule changes. (A third,
+  `alias("team lead")` leaking a job title into `stack`, was closed on 2026-08-17 by adding the
+  phrase to `STACK_STOPLIST` — the test now guards the fix.)
+  - `fold_homoglyphs("РОСТ") == "POCT"` — every letter is a lookalike, so a real Russian word fully
+    Latinizes and the all-or-nothing guard cannot tell. Not reachable from the current corpus.
+  - `currency_enum("xyz") == "XYZ"` — the length-3 ASCII passthrough cannot distinguish a currency
+    from any other three-letter string.
 - **Whether to keep `pydantic-ai`.** It handles validate-and-retry natively — write the manual loop
   once first (~20 lines: call → `model_validate_json()` → catch `ValidationError` → feed the error
   back → retry), then adopt the framework knowing what it hides.

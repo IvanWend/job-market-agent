@@ -95,7 +95,7 @@ STACK_STOPLIST = frozenset({
     "contract", "internship", "entry-level", "junior", "senior", "lead", "non-tech",
     "engineer", "developer", "dev", "executive", "operations", "sales", "marketing",
     "crypto", "blockchain", "web3", "defi", "bitcoin", "ethereum",
-    "united-states", "china", "europe", "worldwide", "usa", "uk",
+    "united-states", "china", "europe", "worldwide", "usa", "uk", "team lead",
     "управление проектами", "управление рисками", "управление людьми",
     "управление разработкой", "планирование", "построение команды",
     "оптимизация бизнес-процессов", "информационная безопасность",

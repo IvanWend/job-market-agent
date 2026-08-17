@@ -1,0 +1,248 @@
+from typing import Any
+
+import pytest
+
+from src.extraction.normalize import (
+    Employment,
+    RemotePolicy,
+    Seniority,
+    alias,
+    blank_to_none,
+    currency_enum,
+    employment_enum,
+    fold_homoglyphs,
+    html_to_text,
+    normalize_stack,
+    remote_policy_enum,
+    seniority_enum,
+    to_monthly,
+    to_number,
+)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("180k", 180000.0),
+        ("$180k", 180000.0),
+        ("1.5M", 1500000.0),
+        ("250 000", 250000.0),
+        ("300к", 300000.0),
+        (180000, 180000.0),
+    ],
+)
+def test_to_number(raw: float | str, expected: float) -> None:
+    assert to_number(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "competitive", "от 75 000 ₽"])
+def test_to_number_rejects(raw: str) -> None:
+    with pytest.raises(ValueError):
+        to_number(raw)
+
+
+@pytest.mark.parametrize(
+    "amount, period, expected",
+    [
+        (75000, "month", 75000),
+        (270000, "month", 270000),
+        ("$180k", "year", 15000),
+        ("50", "hour", 8666),
+    ],
+)
+def test_to_monthly(amount: float | str, period: str, expected: int) -> None:
+    assert to_monthly(amount, period) == expected
+
+
+def test_to_monthly_rejects_unknown_period() -> None:
+    # Deliberate raise, not a monthly default: a default produces a
+    # plausible-looking number nothing downstream can catch.
+    with pytest.raises(ValueError, match="unknown salary period"):
+        to_monthly(100, "week")
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("Middle", "mid"),
+        ("Senior", "senior"),
+        ("Junior", "junior"),
+        (None, "unknown"),
+        ("Team Lead", "staff+"),
+        ("стажёр", "intern"),
+        # Provisional: compound seniority is still open in ROADMAP. Update when
+        # the range-rounds-up rule lands.
+        ("Mid-Senior/Senior", "unknown"),
+    ],
+)
+def test_seniority_enum(raw: str | None, expected: Seniority) -> None:
+    assert seniority_enum(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # Habr and Remotive both send full_time; only the underscore fold in
+        # employment_enum maps it, _EMPLOYMENT has no such key.
+        ("full_time", "full-time"),
+        ("contract", "contract"),
+        (None, "unknown"),
+        ("", "unknown"),
+    ],
+)
+def test_employment_enum(raw: str | None, expected: Employment) -> None:
+    assert employment_enum(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (True, "remote"),
+        # Not "onsite": a missing remote flag is not evidence of an office.
+        (False, "unknown"),
+        ("Worldwide", "remote"),
+        ("USA, CST (UTC-6)", "unknown"),
+        ("hybrid", "hybrid"),
+    ],
+)
+def test_remote_policy_enum(raw: str | bool, expected: RemotePolicy) -> None:
+    assert remote_policy_enum(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("rur", "RUB"),
+        ("$", "USD"),
+        (None, None),
+        # Current behaviour, not correct behaviour: the len-3 passthrough cannot
+        # tell a currency from any other three-letter string.
+        ("xyz", "XYZ"),
+        ("Worldwide", None),
+    ],
+)
+def test_currency_enum(raw: str | None, expected: str | None) -> None:
+    assert currency_enum(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # The containment guard: inline markup must not break a sentence, or a
+        # quote spanning <strong> fails against the converted text.
+        (
+            "<p><strong>ИТ-Холдинг Т1 —\xa0</strong>один из лидеров</p>",
+            "ИТ-Холдинг Т1 — один из лидеров",
+        ),
+        (
+            '<div class="h3"><strong>Position:</strong> Account Executive</div>',
+            "Position: Account Executive",
+        ),
+        ("line one<br/>line two", "line one\nline two"),
+        ("<p>a</p><p>b</p><p>c</p>", "a\n\nb\n\nc"),
+        ("<ul><li>one</li><li>two</li></ul>", "one\n\ntwo"),
+        # Remotive pads with <p>&nbsp;</p>; the blank run must collapse, not
+        # accumulate.
+        ("<p>a</p>\n<p>\xa0</p>\n<p>b</p>", "a\n\nb"),
+        ("   spaced   out   words   ", "spaced out words"),
+        ("plain text no tags", "plain text no tags"),
+        (None, ""),
+        ("", ""),
+    ],
+)
+def test_html_to_text(raw: str | None, expected: str) -> None:
+    assert html_to_text(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("", None),
+        ("  ", None),
+        ("null", None),
+        ("N/A", None),
+        ("—", None),
+        ("  Java  ", "Java"),
+        (None, None),
+        # Strings only: a numeric 0 is a real salary floor, and False has to
+        # survive for remote_policy_enum's bool branch.
+        (0, 0),
+        (False, False),
+        (75000, 75000),
+    ],
+)
+def test_blank_to_none(raw: Any, expected: Any) -> None:
+    assert blank_to_none(raw) == expected
+
+
+def test_blank_to_none_extra() -> None:
+    assert blank_to_none("Worldwide", extra=["worldwide"]) is None
+    assert blank_to_none("Europe", extra=["worldwide"]) == "Europe"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # 1С with a Cyrillic С folds to Latin; 33 corpus rows spell it this way.
+        ("1С", "1C"),
+        # Г is not a lookalike, so the fold leaves Cyrillic and is rejected whole.
+        ("ГОСТ", "ГОСТ"),
+        ("Управление рисками", "Управление рисками"),
+        ("Docker", "Docker"),
+        # Known false positive: every letter is a lookalike, so a real Russian
+        # word Latinizes and the all-or-nothing guard cannot tell.
+        ("РОСТ", "POCT"),
+    ],
+)
+def test_fold_homoglyphs(raw: str, expected: str) -> None:
+    assert fold_homoglyphs(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("Golang", "go"),
+        ("postgresql", "postgres"),
+        ("Java Spring Framework", "spring"),
+        ("Oracle PL/SQL", "plsql"),
+        ("REST", "rest-api"),
+        ("next.js", "nextjs"),
+        ("Объектное хранилище S3", "s3"),
+        ("ГОСТ", "gost"),
+        ("1С", "1c"),
+        ("Typescript ", "typescript"),
+        # Cyrillic process/domain skills are dropped wholesale.
+        ("Управление рисками", None),
+        ("remote", None),
+        ("non-tech", None),
+        ("", None),
+        (None, None),
+        # Unmapped and un-stoplisted survives as-is, lowercased.
+        ("Waterfall", "waterfall"),
+        # Stoplisted as a phrase: "lead" alone does not match the web3 tag.
+        ("team lead", None),
+    ],
+)
+def test_alias(raw: str | None, expected: str | None) -> None:
+    assert alias(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (
+            ["Управление рисками", "Waterfall", "Java", "Git", "Docker", "Java Spring Framework"],
+            ["waterfall", "java", "git", "docker", "spring"],
+        ),
+        (
+            ["remote", "defi", "erc-20", "smart-contract", "blockchain"],
+            ["erc-20", "smart-contract"],
+        ),
+        # Aliasing collapses variants, and insertion order is preserved.
+        (["Golang", "go", "golang", "postgresql", "postgres"], ["go", "postgres"]),
+        (["Java", None, "", "Java"], ["java"]),
+        ([], []),
+    ],
+)
+def test_normalize_stack(raw: list[str | None], expected: list[str]) -> None:
+    assert normalize_stack(raw) == expected

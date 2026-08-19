@@ -6,6 +6,9 @@ __pycache__/
 # Secrets — .env.example is committed, .env never is
 .env
 
+# Local-only notes — deliberately not shared
+CLAUDE.md
+
 # Ingested data / gold-set working copies
 docs/DB_CONNECT.md
 docs/DB_INSPECT.md

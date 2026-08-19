@@ -230,6 +230,16 @@ actually keeps the baseline frozen. Rebuild the gold-set candidate pool with:
 uv run python -m evals.generate_gold_dataset   # → evals/gold_40_candidates.json (git-ignored)
 ```
 
+Toolchain gate — everything below passes before any commit:
+
+```bash
+uv run ruff check src/ evals/ tests/ && uv run mypy src/ tests/ && uv run pytest -q
+```
+
+`pytest` needs `pythonpath = ["."]` from `[tool.pytest.ini_options]`: nothing is installed (no
+`[build-system]`), so without it only `tests/` lands on `sys.path` and `import src` fails at
+collection.
+
 **WSL2 + mirrored networking gotcha:** if step 2 fails with `failed to bind host port ... address
 already in use`, something on the **Windows host** already owns 5432 — `networkingMode=mirrored`
 means Windows and WSL share the port space. Check `Get-Service *postgres*` in PowerShell; a native
@@ -277,7 +287,6 @@ tests/
 evals/
   generate_gold_dataset.py  # seeded 40-row gold-set sample from the frozen snapshot
   snapshots/                # frozen dumps — eval inputs, committed
-CLAUDE.md              # stable brief: working style, conventions, environment gotchas (auto-loaded)
 docs/
   ROADMAP.md           # phased plan with progress checkboxes + decision log
   PROMPT.md            # volatile session state: where we left off / next up

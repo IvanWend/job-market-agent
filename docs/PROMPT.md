@@ -1,8 +1,8 @@
 # Session state
 
 Volatile half only — where the work stands right now. The stable half (project brief, working
-style, conventions, environment gotchas) lives in `CLAUDE.md` and loads automatically; don't paste
-it and don't duplicate it back here.
+style, conventions, environment gotchas) lives in a local, git-ignored `CLAUDE.md` that loads
+automatically; don't paste it and don't duplicate it back here.
 
 Paste this to start the next session:
 
@@ -15,16 +15,12 @@ end and verified** on one row per source — `source_adapters` → LLM → `sche
 **This session: testing got unblocked.** pytest added as a dev dependency,
 `[tool.pytest.ini_options]` added (`testpaths`, and `pythonpath = ["."]` — without it `import src`
 fails at collection because nothing is installed), and `tests/test_normalize.py` written: **83
-parametrized cases over all ten public functions** in `normalize.py`. Uncommitted. Gate is green —
-`uv run ruff check src/ evals/ tests/ && uv run mypy src/ tests/ && uv run pytest -q`.
+parametrized cases over all ten public functions** in `normalize.py`. Committed in `b1e8f31`; the
+gate is in the README and green.
 
 **Next up:** tests for `schema.py` / `transform.py` → settle the labeling questions → hand-label
 `evals/gold_labeled.json` → eval script → extraction pipeline module with the retry loop →
 Langfuse. `source_adapters.py` tests want the offline fixtures, so those two land together.
-
-**Two loose ends before committing.** `tests/test_experiment.ipynb` is a notebook sitting in
-`tests/` — notebooks are `experiments/` material, and `.gitignore` covers `experiments/*` but not
-this. And `CLAUDE.md` is still untracked.
 
 **Settle the labeling questions in ROADMAP "Still open" before labeling** — each decides what a
 correct label *is*, and relabeling 40 rows twice is the expensive mistake here. Short version:

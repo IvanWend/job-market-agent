@@ -93,9 +93,7 @@ def _hn(raw_text: str, external_id: str) -> ExtractionInput:
     if _HN_DEAD.match(text) or len(text) < HN_MIN_CHARS:
         prefilter = "other"
     # HN is pure prose: the whole comment is the input and nothing is held out.
-    return ExtractionInput(
-        source="hn", external_id=external_id, text=text, prefilter=prefilter
-    )
+    return ExtractionInput(source="hn", external_id=external_id, text=text, prefilter=prefilter)
 
 
 def _habr(raw: dict[str, Any], external_id: str) -> ExtractionInput:
@@ -165,9 +163,7 @@ def _web3(raw: dict[str, Any], external_id: str) -> ExtractionInput:
 def _remotive(raw: dict[str, Any], external_id: str) -> ExtractionInput:
     salary_raw = (raw.get("salary") or "").strip() or None
     gt = GroundTruth(
-        held_out=frozenset(
-            {"company", "title", "stack", "location", "employment_type"}
-        ),
+        held_out=frozenset({"company", "title", "stack", "location", "employment_type"}),
         company=raw.get("company_name"),
         title=raw.get("title"),
         stack=normalize_stack(raw.get("tags") or []),

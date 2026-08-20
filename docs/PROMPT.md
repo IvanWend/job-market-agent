@@ -8,36 +8,56 @@ Paste this to start the next session:
 
 ---
 
-**Where we left off (2026-08-17).** Phase 1 is closed. Phase 2's extraction path is **wired end to
-end and verified** on one row per source — `source_adapters` → LLM → `schema` validators →
-`transform` → `NormalizedRole` (four modules, committed in `a0cabb9`).
+**Vertical slice, step 1 of 4** (locked 2026-08-19 in DECISIONS.md under "Pipeline"): full
+extraction pass → embeddings + `vector_search` → agent loop + FastAPI/SSE → *then* label. Labeling,
+the eval script and the remaining extraction tests stay deferred. Don't re-litigate it into eval
+work.
 
-**This session: testing got unblocked.** pytest added as a dev dependency,
-`[tool.pytest.ini_options]` added (`testpaths`, and `pythonpath = ["."]` — without it `import src`
-fails at collection because nothing is installed), and `tests/test_normalize.py` written: **83
-parametrized cases over all ten public functions** in `normalize.py`. Committed in `b1e8f31`; the
-gate is in the README and green.
+**Where we left off (2026-08-20).** `pipeline.py` has `pending`, `build_agent`, `extract` and
+`persist`. `persist` is verified against the live DB — all three statuses, every column landing in
+the right place, and a re-run with fewer roles clearing the orphans — inside a rolled-back
+transaction, so `extraction_runs` and `structured_postings` are both still empty and `pending()`
+returns the full 1,098 (502 hn). Gate green: ruff, mypy over 17 files, 83 tests.
 
-**Next up:** tests for `schema.py` / `transform.py` → settle the labeling questions → hand-label
-`evals/gold_labeled.json` → eval script → extraction pipeline module with the retry loop →
-Langfuse. `source_adapters.py` tests want the offline fixtures, so those two land together.
+`extract`'s LLM path has **not** survived a real DeepSeek response end to end. Everything up to
+`agent.run` is exercised; `transform(result.output)` against real model output is what the pilot
+proves.
 
-**Settle the labeling questions in ROADMAP "Still open" before labeling** — each decides what a
-correct label *is*, and relabeling 40 rows twice is the expensive mistake here. Short version:
-`stack` ground truth barely intersects extracted stack; card fields contradict body prose on Habr
-and Remotive; `location` has no normalizer; a quote for a `None` field goes unchecked. Two
-`normalize.py` holes are pinned by tests as *current* behaviour and logged in the same section; a
-third (`"team lead"` leaking into `stack`) was closed this session by extending `STACK_STOPLIST`.
+**Two decisions locked today**, both in DECISIONS.md:
 
-Two things that will bite the eval script specifically:
+- Embeddings are `bge-m3` via Ollama at `vector(1024)`. 42% of the corpus is Russian; measured RU/EN
+  paraphrase cosine 0.824 on the local instance, and 8192-token context vs `bge-small`'s 512.
+  README, ROADMAP and DECISIONS are already updated together; the `posting_embeddings` DDL is not
+  written yet and must use 1024.
+- `extract` catches `(AgentRunError, TimeoutError)` only, never bare `Exception`.
 
-- **Containment runs against `html_to_text(raw_text)`, never `raw_text`** — and must whitespace-
-  normalize both sides, because source prose is hard-wrapped mid-sentence. `test_html_to_text`
-  guards the inline-markup half of this (a quote spanning `<strong>` must not split); the
-  whitespace half belongs to the eval script and is still unwritten.
-- **Only Habr's salary has a known period.** Web3 and Remotive amounts stay unconverted in
-  `salary_raw`; skip salary scoring there rather than guessing a period.
+**Next up — `run` and `main`, then the pilot** (`--limit 20 --source hn`) to measure cost and
+wall-clock, then the full 1,098-row pass.
 
-Start by checking the current state of the repo in case I've changed things since.
+`run(conn, agent, rows, model, chunk_size)`:
+
+- Chunk `rows`; per chunk build payloads with `to_extraction_input`, `asyncio.gather` the `extract`
+  calls, then loop the results and `persist` **serially**. One psycopg connection is not safe for
+  concurrent use — no DB access inside a gathered task.
+- `persist` opens its own `conn.transaction()`, so don't wrap the loop in another one: on an
+  already-open transaction the inner block demotes to a savepoint and the chunk stops being
+  independently committed.
+- Wrap `to_extraction_input` in try/except — a malformed Habr blob would otherwise kill the chunk.
+  Synthesize `Outcome(status="error", model="adapter", ...)` so the row is still claimed.
+- Accumulate ok/invalid/error, roles, `tokens_in`/`tokens_out`/`requests`; print one checkpoint line
+  per chunk. Return a small `Stats` NamedTuple. Chunk size doubles as the checkpoint interval —
+  start at 5, since `retries=2` means one row can be three calls.
+
+`main()`: argparse `--limit`, `--source`, `--model`, `--chunk-size`, `--dry-run` → connect →
+`pending` → `build_agent` → `run` → print the summary. It currently hardcodes `sources=["hn"],
+limit=5` and does its own serial loop; that whole body is what gets replaced.
+
+**Still open before the full pass:** Langfuse. DECISIONS says every LLM call is traced from the
+first one, but no `langfuse` dependency is installed — `logfire` 4.40.0 is. Cheapest route is
+`Agent(..., instrument=True)` + OTLP export. Decide before the pilot or amend the decision.
+Also consider `UsageLimits` on the agent so a retry storm can't run away unattended.
+
+**Concept I want explained tomorrow:** async/await — what `asyncio.gather` actually does, why the
+chunked-gather-then-write-serially shape is required here, and what `await` is really yielding to.
 
 ---

@@ -26,7 +26,7 @@ deployment.
 INGESTION    HN (Algolia) + Remotive + Web3.career + Habr Career ──►  raw_postings (Postgres)
 RETENTION    rolling 90-day window — filtered at ingest, purged on age
 EXTRACTION   LLM + Pydantic schema, grounded by verbatim quotes ──►  structured_postings
-STORAGE      Postgres + pgvector; local bge-small-en-v1.5 embeddings ──►  posting_embeddings
+STORAGE      Postgres + pgvector; local bge-m3 embeddings (1024-dim) ──►  posting_embeddings
 AGENT        DeepSeek tool-calling loop: sql_query · vector_search · resume_match
 SERVING      FastAPI (SSE streaming) · Langfuse tracing · Docker Compose
 ```
@@ -49,7 +49,7 @@ cv-tailor-ru).
 | Language | Python 3.13 (pinned via `.python-version`; `requires-python >=3.12`) |
 | Agent + extraction LLM | DeepSeek (OpenAI-compatible API); Groq fallback |
 | Structured outputs | Pydantic v2 — the schema is the contract for extraction *and* evals |
-| Embeddings | **Undecided** — `BAAI/bge-small-en-v1.5` via sentence-transformers (384-dim) as designed, vs. `bge-m3` via the already-installed local Ollama (1024-dim). Fixes `vector(n)`, so decide before Phase 3 ([ROADMAP](docs/ROADMAP.md#phase-3--storage--retrieval)) |
+| Embeddings | `bge-m3` via local Ollama, `vector(1024)` — multilingual, 8192-token context, no torch dependency ([DECISIONS](docs/DECISIONS.md#storage)) |
 | HTML parsing | BeautifulSoup 4 (stdlib `html.parser` backend) — Habr description bodies |
 | Database | Postgres 17 + pgvector (single DB: relational + vector) |
 | API | FastAPI, SSE streaming |
@@ -128,9 +128,10 @@ A multi-role posting splits into **one record per role** (`company` posting-leve
 replaces), so `structured_postings` is 1:N with `raw_postings`. Five validators enforce the
 grounding rules: blank-string coercion, salary coherence, `source_quotes` keys must be real field
 names, required quotes on the fields where the spike fabricated, and the non-posting shape. Details
-and the open labeling questions are in the [roadmap](docs/ROADMAP.md#phase-2--extraction--evals).
+and the open labeling questions are in [docs/DECISIONS.md](docs/DECISIONS.md).
 
-**Database schema** (Postgres — `raw_postings` finalized, others draft):
+**Database schema** (Postgres — `raw_postings`, `structured_postings` and `extraction_runs`
+finalized; `posting_embeddings` draft):
 
 ```sql
 raw_postings (
@@ -140,9 +141,25 @@ raw_postings (
   CHECK (source IN ('hn','remotive','web3','habr')), UNIQUE (source, external_id)
 )
 db_meta ( singleton BOOL PK, role TEXT CHECK (role IN ('live','eval')) )  -- purge guard
-structured_postings ( id, raw_posting_id FK, extracted JSONB, model, prompt_version, extracted_at )
+structured_postings (            -- one row per ROLE, 1:N with raw_postings
+  id BIGINT IDENTITY PK, raw_posting_id FK ON DELETE CASCADE, role_index INT,
+  company TEXT, title TEXT, location TEXT,
+  seniority TEXT, remote_policy TEXT, employment_type TEXT,   -- NOT NULL DEFAULT 'unknown', CHECKed
+  stack TEXT[], salary_min INT, salary_max INT, salary_currency TEXT,  -- salary monthly
+  source_quotes JSONB, created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ,
+  UNIQUE (raw_posting_id, role_index)
+)
+extraction_runs (                -- one row per raw posting, success or not
+  raw_posting_id FK PK ON DELETE CASCADE, status TEXT CHECK (status IN ('ok','invalid','error')),
+  doc_type TEXT, role_count INT, model TEXT, error TEXT, extracted_at TIMESTAMPTZ
+)
 posting_embeddings  ( posting_id FK, embedding vector(384|1024), embedded_text )  -- dim TBD
 ```
+
+Two tables, not one, because a non-posting extracts *successfully* into **zero** role rows — a
+résumé in the wrong HN thread is indistinguishable from a row never attempted. `extraction_runs` is
+what makes the pass resumable (`WHERE NOT EXISTS`) and its coverage countable. `ON DELETE CASCADE`
+on both is load-bearing: the 90-day purge deletes `raw_postings` out from under them.
 
 `posted_at` is `NOT NULL` because the purge filters on it and `WHERE posted_at < …` silently skips
 NULLs — those rows would live forever. `db_meta` holds one row saying whether this database is the
@@ -195,6 +212,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/003_retention.sql
 #   004 narrows the source CHECK and only applies once no adzuna rows remain — Postgres validates
 #   a new CHECK against existing rows, so run the purge first on a pre-pivot database.
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/004_source_check.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/schema/005_structured_postings.sql
 
 # 4. .env (git-ignored) — see .env.example
 #   POSTGRES_PASSWORD=...
@@ -256,7 +274,7 @@ it proves `DATABASE_URL` actually works before the loader depends on it.
 **If Ollama is on a Windows host** (the current setup), reach it from WSL at `localhost:11434` with
 `networkingMode=mirrored` in `.wslconfig`. Keep `no_proxy` free of glob patterns — `curl` tolerates
 `127.*` and `<local>`, but `urllib`/`requests`/`httpx` do not, and localhost calls will silently
-take the proxy. See the environment table in [docs/ROADMAP.md](docs/ROADMAP.md).
+take the proxy. See [docs/GOTCHAS.md](docs/GOTCHAS.md).
 
 ## Project structure
 
@@ -266,7 +284,7 @@ pyproject.toml         # deps (uv) + ruff/mypy/pytest config; uv.lock is committ
 .env.example           # committed key names, no values; .env is git-ignored
 .gitattributes         # force LF (files cross into the Linux Postgres container)
 docker-compose.yml     # Postgres 17 + pgvector, healthcheck, pgdata volume, ./init mount
-db/schema/             # numbered, re-runnable DDL (001 raw_postings … 004 source CHECK)
+db/schema/             # numbered, re-runnable DDL (001 raw_postings … 005 structured_postings)
 init/                  # first-boot bootstrap only — vector + pg_trgm
 src/
   ingestion/
@@ -282,13 +300,17 @@ src/
     schema.py          # the four Pydantic models + five grounding validators. No I/O, no LLM.
     source_adapters.py # (source, raw_text) -> ExtractionInput(text, ground_truth, prefilter)
     transform.py       # fill-down + conversion: PostingExtraction -> NormalizedPosting
+    prompt.py          # SYSTEM_PROMPT only — kept apart so prompt edits are a clean diff
+    pipeline.py        # resume query, agent, extract -> transform -> persist. The only DB writer.
 tests/
   test_normalize.py    # parametrized unit tests over normalize.py's ten public functions
 evals/
   generate_gold_dataset.py  # seeded 40-row gold-set sample from the frozen snapshot
   snapshots/                # frozen dumps — eval inputs, committed
 docs/
-  ROADMAP.md           # phased plan with progress checkboxes + decision log
+  ROADMAP.md           # data flow, current state, per-phase checklists, what is next
+  DECISIONS.md         # one entry per locked decision + the open questions
+  GOTCHAS.md           # traps that bite in later phases: symptom -> cause -> fix
   PROMPT.md            # volatile session state: where we left off / next up
 ```
 

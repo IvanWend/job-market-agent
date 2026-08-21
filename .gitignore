@@ -10,15 +10,12 @@ __pycache__/
 CLAUDE.md
 
 # Ingested data / gold-set working copies
-docs/DB_CONNECT.md
-docs/DB_INSPECT.md
-docs/DB_MANAGE.md
-data/
+docs/
 evals/candidates_*.json
 # Working copies carry raw_text; only evals/gold_labeled.json is committed.
 evals/gold_*_candidates.json
 experiments/*
-
+gi
 # Tooling caches
 .ruff_cache/
 .mypy_cache/

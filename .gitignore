@@ -6,16 +6,21 @@ __pycache__/
 # Secrets — .env.example is committed, .env never is
 .env
 
-# Local-only notes — deliberately not shared
+# Local-only notes — deliberately not shared. docs/ROADMAP.md stays tracked;
+# a bare `docs/` here would exclude it, and gitignore cannot re-include a file
+# whose parent directory is excluded.
 CLAUDE.md
+docs/DECISIONS.md
+docs/GOTCHAS.md
+docs/PROMPT.md
+docs/DB_*.md
 
 # Ingested data / gold-set working copies
-docs/
 evals/candidates_*.json
 # Working copies carry raw_text; only evals/gold_labeled.json is committed.
 evals/gold_*_candidates.json
 experiments/*
-gi
+
 # Tooling caches
 .ruff_cache/
 .mypy_cache/

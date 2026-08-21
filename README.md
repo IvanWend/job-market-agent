@@ -13,8 +13,7 @@ Remotive 36). The eval baseline is frozen (`jobmarket_eval`, read-only role) and
 candidate pool is sampled. **Phase 2 in progress:** the extraction path runs end to end — source
 adapter → LLM → Pydantic validators → normalize/fill-down — across all four sources. Hand-labeling,
 the eval script and Langfuse are next. See
-[docs/ROADMAP.md](docs/ROADMAP.md) for what is built vs. planned, and
-[docs/PROMPT.md](docs/PROMPT.md) for the session-kickoff brief.
+[docs/ROADMAP.md](docs/ROADMAP.md) for what is built vs. planned.
 
 **Career signals targeted:** structured LLM extraction from unstructured text, RAG over a
 self-built corpus, agent tool-calling, eval-driven development, LLM observability, containerized
@@ -49,7 +48,7 @@ cv-tailor-ru).
 | Language | Python 3.13 (pinned via `.python-version`; `requires-python >=3.12`) |
 | Agent + extraction LLM | DeepSeek (OpenAI-compatible API); Groq fallback |
 | Structured outputs | Pydantic v2 — the schema is the contract for extraction *and* evals |
-| Embeddings | `bge-m3` via local Ollama, `vector(1024)` — multilingual, 8192-token context, no torch dependency ([DECISIONS](docs/DECISIONS.md#storage)) |
+| Embeddings | `bge-m3` via local Ollama, `vector(1024)` — multilingual, 8192-token context, no torch dependency |
 | HTML parsing | BeautifulSoup 4 (stdlib `html.parser` backend) — Habr description bodies |
 | Database | Postgres 17 + pgvector (single DB: relational + vector) |
 | API | FastAPI, SSE streaming |
@@ -127,8 +126,7 @@ A multi-role posting splits into **one record per role** (`company` posting-leve
 `seniority` role-level, the other eight inherit-with-override — `stack` unions rather than
 replaces), so `structured_postings` is 1:N with `raw_postings`. Five validators enforce the
 grounding rules: blank-string coercion, salary coherence, `source_quotes` keys must be real field
-names, required quotes on the fields where the spike fabricated, and the non-posting shape. Details
-and the open labeling questions are in [docs/DECISIONS.md](docs/DECISIONS.md).
+names, required quotes on the fields where the spike fabricated, and the non-posting shape.
 
 **Database schema** (Postgres — `raw_postings`, `structured_postings` and `extraction_runs`
 finalized; `posting_embeddings` draft):
@@ -274,7 +272,7 @@ it proves `DATABASE_URL` actually works before the loader depends on it.
 **If Ollama is on a Windows host** (the current setup), reach it from WSL at `localhost:11434` with
 `networkingMode=mirrored` in `.wslconfig`. Keep `no_proxy` free of glob patterns — `curl` tolerates
 `127.*` and `<local>`, but `urllib`/`requests`/`httpx` do not, and localhost calls will silently
-take the proxy. See [docs/GOTCHAS.md](docs/GOTCHAS.md).
+take the proxy.
 
 ## Project structure
 
@@ -309,9 +307,6 @@ evals/
   snapshots/                # frozen dumps — eval inputs, committed
 docs/
   ROADMAP.md           # data flow, current state, per-phase checklists, what is next
-  DECISIONS.md         # one entry per locked decision + the open questions
-  GOTCHAS.md           # traps that bite in later phases: symptom -> cause -> fix
-  PROMPT.md            # volatile session state: where we left off / next up
 ```
 
 Two schema mechanisms, one job each: `init/` is **bootstrap** (runs once, only when the data

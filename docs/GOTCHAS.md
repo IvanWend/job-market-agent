@@ -85,6 +85,13 @@ Symptom → cause → fix. Decisions live in DECISIONS.md; progress lives in ROA
 - **A crash drops rows from the resume query forever.** Write `extraction_runs` *last*, in the same
   transaction as the role rows, so a crash mid-write leaves the row unclaimed. Claim-then-work
   silently loses it.
+- **`Agent(..., instrument=True)` raises `TypeError: unexpected keyword argument`.** On pydantic-ai
+  2.24 `instrument` is not an `__init__` parameter — it is a settable attribute (`agent.instrument =
+  True`) or the static `Agent.instrument_all()`. Most tutorials show the kwarg form.
+- **Langfuse stays empty and nothing errors.** `BatchSpanProcessor` buffers spans and flushes on a
+  background thread, so a short script exits before the last chunk's spans leave the process. Call
+  `provider.shutdown()` in a `finally` around the run. Second suspect: the exporter speaks through
+  `requests`, so it honors `HTTPS_PROXY` from `~/.proxy.env`.
 - **`result.usage()` raises `'RunUsage' object is not callable`.** On `AgentRunResult` (pydantic-ai
   2.24) `usage` is a **property**, not a method. `RunUsage` itself carries `input_tokens`,
   `output_tokens` and `requests` — `requests` counts real API calls, so it is the retry-storm meter.

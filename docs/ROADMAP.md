@@ -14,13 +14,13 @@ STORAGE      Postgres + pgvector; local bge-m3 embeddings (1024-dim) ──►  
 AGENT        DeepSeek tool-calling loop: sql_query · vector_search · resume_match
 SERVING      FastAPI (SSE streaming) · Langfuse tracing · Docker Compose
 
-## Current state (2026-08-20)
+## Current state (2026-08-21)
 
 Phase 2, sequenced as a vertical slice (see DECISIONS: pipeline). `pipeline.py` has `pending`,
-`build_agent`, `extract` and `persist`; `persist` is verified against the live DB across all three
-statuses and the orphan-clearing re-run. **Blocking:** `run` and `main` are unwritten, so nothing has
-been extracted at scale yet. `extract`'s LLM path has not survived a real DeepSeek response end to
-end — that happens on the pilot.
+`build_agent`, `extract`, `persist` and `run`; `persist` is verified against the live DB across all
+three statuses and the orphan-clearing re-run. **Blocking:** `main` is still the old serial stub, so
+`run` has never executed and no LLM call has been made yet. `extract`'s LLM path has not survived a
+real DeepSeek response end to end — that happens on the pilot.
 
 **Corpus** — 1,098 rows, remote-only, all inside the rolling 90-day window: hn 502, habr 460,
 web3 100, remotive 36.
@@ -43,12 +43,13 @@ web3 100, remotive 36.
 - [x] `db/schema/005_structured_postings.sql` (see DECISIONS: storage)
 - [x] `src/extraction/prompt.py` — `SYSTEM_PROMPT`, injected so prompt edits stay a clean diff
 - [x] `src/extraction/pipeline.py` — `pending`, `build_agent`, `extract`, `persist`
-- [ ] `src/extraction/pipeline.py` — `run` (chunked gather, serial writes), `main` (argparse)
+- [x] `src/extraction/pipeline.py` — `run` (chunked gather, serial writes)
+- [ ] `src/extraction/pipeline.py` — `main` (argparse, `--dry-run`, wall-clock + `Stats` summary)
+- [ ] Langfuse Cloud over OTLP, wired in `main` (see DECISIONS: pipeline)
 - [ ] Pilot `--limit 20 --source hn` to measure cost and wall-clock, then the full corpus pass
 - [ ] Tests for `schema.py`, `source_adapters.py`, `transform.py` — need the offline fixtures below
 - [ ] Hand-label `evals/gold_labeled.json`, keyed on `(source, external_id)` (see DECISIONS)
 - [ ] Eval script: per-field accuracy, `doc_type`, role count, role alignment (see DECISIONS)
-- [ ] Langfuse wired into every extraction call
 - [ ] Iterate the prompt until acceptable accuracy (set the threshold after the first run)
 - [ ] Cache a fixture response per source so the demo path runs offline
 
@@ -75,7 +76,7 @@ web3 100, remotive 36.
 
 ## Next
 
-1. `pipeline.py` — `run` → `main`
+1. `pipeline.py` — `main`, then Langfuse wiring inside it
 2. Pilot 20 HN rows; measure cost and wall-clock
 3. Full corpus extraction pass — accept bad output, store it
 4. `embed.py` + the `posting_embeddings` DDL at `vector(1024)`

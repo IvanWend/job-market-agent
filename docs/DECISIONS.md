@@ -107,6 +107,14 @@ PrairieLearn, Proton), and a regex's mistakes are invisible where a scored field
 ### Every LLM call is traced to Langfuse from the first one — undated
 Why: retrofitting tracing after a full corpus pass loses the run it would have explained.
 
+### Tracing is Langfuse Cloud over raw OTLP — locked 2026-08-21
+`Agent.instrument_all()` plus a `TracerProvider` + `BatchSpanProcessor(OTLPSpanExporter())` pointed
+at Langfuse's OTLP endpoint by env var. The OpenTelemetry SDK and HTTP exporter are already present
+transitively via `logfire`, so this adds no dependency and no config surface of its own.
+Rejected: self-hosting Langfuse — v3 wants ClickHouse, Redis and MinIO alongside the project's own
+Postgres, which is a lot of compose for a 20-row pilot. Rejected: `logfire.configure()` as the
+provider — it works, but hides the exporter wiring behind a second config layer.
+
 ## Storage
 
 ### `structured_postings` is 1:N with `raw_postings` — undated

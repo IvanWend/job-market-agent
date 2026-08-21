@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple
@@ -14,6 +15,8 @@ from src.extraction.source_adapters import ExtractionInput, to_extraction_input
 from src.extraction.transform import transform
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 INSERT_ROLE_SQL = """
@@ -43,6 +46,16 @@ class RawRow(NamedTuple):
     source: str
     external_id: str
     raw_text: str
+
+
+class Stats(NamedTuple):
+    ok: int = 0
+    invalid: int = 0
+    error: int = 0
+    roles: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    requests: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,7 +182,92 @@ def persist(conn, raw_posting_id: int, outcome: Outcome) -> None:
         )
 
 
+async def run(
+    conn, agent: Agent[None, PostingExtraction], rows: list[RawRow], model: str, chunk_size: int = 5
+) -> Stats:
+
+    ok_count = 0
+    invalid_count = 0
+    error_count = 0
+    roles_count = 0
+    tokens_in_total = 0
+    tokens_out_total = 0
+    requests_count = 0
+
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i : i + chunk_size]
+        logger.info("Processing chunk of %d rows...", len(chunk))
+
+        failed_outcomes = []
+        failed_rows = []
+        payloads = []
+
+        for row in chunk:
+            try:
+                payload = to_extraction_input(row.source, row.external_id, row.raw_text)
+                payloads.append(payload)
+            except Exception as exc:
+                error_outcome = Outcome(status="error", model="adapter", error=str(exc)[:500])
+                failed_outcomes.append(error_outcome)
+                failed_rows.append(row.id)
+
+                logger.error("Row %s adapter failed: %s", row.id, str(exc)[:200])
+
+        outcomes = await asyncio.gather(*(extract(agent, p, model) for p in payloads))
+
+        success_idx = 0
+        failure_idx = 0
+
+        for row in chunk:
+            if row.id in failed_rows:
+                outcome = failed_outcomes[failure_idx]
+                failure_idx += 1
+            else:
+                outcome = outcomes[success_idx]
+                success_idx += 1
+
+            persist(conn, row.id, outcome)
+
+            if outcome.status == "ok":
+                ok_count += 1
+            elif outcome.status == "invalid":
+                invalid_count += 1
+            elif outcome.status == "error":
+                error_count += 1
+
+            roles_count += len(outcome.roles)
+            tokens_in_total += outcome.tokens_in
+            tokens_out_total += outcome.tokens_out
+            requests_count += outcome.requests
+
+        done = i + len(chunk)
+        logger.info(
+            "[%d/%d] Progress | ok=%d invalid=%d error=%d roles=%d in=%d out=%d req=%d",
+            done,
+            len(rows),
+            ok_count,
+            invalid_count,
+            error_count,
+            roles_count,
+            tokens_in_total,
+            tokens_out_total,
+            requests_count
+        )
+
+    return Stats(
+        ok=ok_count,
+        invalid=invalid_count,
+        error=error_count,
+        roles=roles_count,
+        tokens_in=tokens_in_total,
+        tokens_out=tokens_out_total,
+        requests=requests_count,
+    )
+
+
 async def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         rows = pending(conn, sources=["hn"], limit=5)
         agent = build_agent(model="deepseek:deepseek-v4-flash", system_prompt=SYSTEM_PROMPT)
